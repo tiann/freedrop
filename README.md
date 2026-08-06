@@ -22,7 +22,8 @@ Every combination works:
 | **sender: browser** | `npx freedrop <code>` | open the link |
 
 The web client is a static page (this repo, deployed to
-`https://weishu.me/freedrop/`) — host it anywhere, or open it locally.
+[freedrop.dev](https://freedrop.dev/)) — host it anywhere, or open it
+locally.
 
 ## How it works
 

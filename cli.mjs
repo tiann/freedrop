@@ -14,7 +14,7 @@ import { createInterface } from "node:readline";
 import qrcode from "qrcode-terminal";
 import { SignalRoom, b64u, DEFAULT_BROKERS } from "./signal.mjs";
 
-const PAGE = process.env.FREEDROP_PAGE ?? "https://weishu.me/freedrop/";
+const PAGE = process.env.FREEDROP_PAGE ?? "https://freedrop.dev/";
 
 const STUN = [
     { urls: "stun:stun.cloudflare.com:3478" },
