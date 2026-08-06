@@ -7,7 +7,8 @@
 // the WebRTC DataChannel: direct P2P, DTLS-encrypted, never through any
 // server. TURN (--turn) is the opt-in relay for NATs P2P can't punch.
 
-import { createReadStream, createWriteStream, existsSync, statSync } from "node:fs";
+import { createReadStream, existsSync, statSync } from "node:fs";
+import { open } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { createInterface } from "node:readline";
@@ -95,6 +96,18 @@ const RTCPeerConnection = await (async () => {
     if (process.env.FREEDROP_RTC !== "js") {
         try {
             const { RTCPeerConnection: PC } = await import("node-datachannel/polyfill");
+            // NOTE: setSctpSettings looks like the obvious lever for
+            // high-latency paths (usrsctp's default buffers cap one
+            // association at ~buffer/RTT), but ANY buffer override makes
+            // this usrsctp build tear down associations under a full-rate
+            // flood — measured with 4 MB and 16 MB alike. Stripes (below)
+            // give WAN paths N congestion windows instead.
+            if (process.env.FREEDROP_DEBUG) {
+                try {
+                    const ndc = await import("node-datachannel");
+                    ndc.initLogger("Warning", (lvl, msg) => console.error(`\n[rtc:${lvl}] ${msg}`));
+                } catch {}
+            }
             native = true;
             return PC;
         } catch {}
@@ -131,19 +144,29 @@ const RTCPeerConnection = await (async () => {
     };
 })();
 
-// The peer announces its message-size limit in the SDP. Big frames mean
-// fewer JS boundary crossings — but werift (announces exactly 65536, vs
-// 256 KB+ for browsers and libdatachannel) crashes or duplicates data on
-// messages near its cap, so any werift end pins the proven 16 KB payload.
+// The peer announces its message-size limit in the SDP. 64 KiB messages
+// measured fastest for libdatachannel (bigger frames are slower: the cost
+// is per-packet, not per-message) — but werift (announces exactly 65536)
+// crashes or duplicates data on messages near its cap, so any end that
+// announces 64 KiB or less gets the proven 16 KB payload.
 const chunkFor = (remoteSdp) => {
     if (!native) return 16 * 1024;
     const m = /a=max-message-size:(\d+)/.exec(remoteSdp);
     const remote = m ? Number(m[1]) : 65536;
     if (remote <= 65536) return 16 * 1024;
-    return Math.min(remote, 256 * 1024) - 9; // 9-byte frame header
+    return Math.min(remote, 64 * 1024) - 9; // 9-byte frame header
 };
 const HIGH_WATER = native ? 16 * 1024 * 1024 : 4 * 1024 * 1024;
 const LOW_WATER = HIGH_WATER / 4;
+
+// One SCTP association is CPU-bound (DTLS + a syscall per packet) around
+// ~220 MB/s; independent associations scale to ~2.3× at four, and on lossy
+// WANs N congestion windows beat one. Extra connections only pay off when
+// the transfer outlasts their ICE setup, hence the size floor. The
+// receiver's hello advertises how many connections it can take (1 for
+// werift, whose engine can't be trusted under a striped flood).
+const STRIPE_CONNS = 4;
+const STRIPE_MIN = 64 * 1024 * 1024;
 
 const candJson = (c) =>
     c.toJSON ? c.toJSON() : { candidate: c.candidate, sdpMid: c.sdpMid, sdpMLineIndex: c.sdpMLineIndex };
@@ -196,10 +219,11 @@ async function turnServers() {
 
 // ---- wire framing -----------------------------------------------------------
 // Every DataChannel message is binary. Tag 1 = UTF-8 JSON control message;
-// tag 0 = file bytes, followed by the 8-byte in-file offset. The offset
-// lets the receiver drop duplicates — werift's receive path replays
-// messages under load — and hard-detects gaps instead of writing a
-// corrupted file. It is also the foundation for resume later.
+// tag 0 = file bytes, followed by an 8-byte offset into the transfer's
+// global byte range (files concatenated in manifest order). The offset
+// lets chunks land positionally from any stripe, lets the receiver drop
+// duplicates — werift's receive path replays messages under load, and a
+// channel's offsets only ever grow — and is the foundation for resume.
 
 const jframe = (obj) => Buffer.concat([Buffer.from([1]), Buffer.from(JSON.stringify(obj))]);
 
@@ -256,6 +280,8 @@ const die = (msg) => {
     process.exit(1);
 };
 
+const dbg = process.env.FREEDROP_DEBUG ? (...a) => console.error("\n[dbg]", ...a) : null;
+
 // ---- send -------------------------------------------------------------------
 
 async function send(paths) {
@@ -277,46 +303,102 @@ async function send(paths) {
     console.log("waiting for receiver…  (Ctrl-C to cancel)");
 
     let sid = null;
-    let pc = null;
-    let dc = null;
+    let dc = null; // control channel (connection 0)
     let chunkSize = 16 * 1024 - 1;
     let drainResolve = null;
-    let gotResolve = null;
     const t0 = { v: 0 };
+    // conns[k]: one WebRTC connection per stripe; conns[0] also carries
+    // control. A stripe joins the pool when its channel opens; one that
+    // dies unused is just ignored, one that dies after carrying data
+    // aborts the transfer — its bytes may be gone.
+    const conns = [];
 
     const cleanupAndExit = (code_) => {
-        try { pc?.close(); } catch {}
+        for (const c of conns) { try { c?.pc.close(); } catch {} }
         room.close();
         process.exit(code_);
     };
 
+    const openPool = () => {
+        const open = [];
+        for (const c of conns) {
+            if (!c) continue;
+            if (c.dc?.readyState === "open") open.push(c);
+            else if (c.used) die("\nconnection lost mid-transfer");
+        }
+        if (!open.length) die("\nconnection lost mid-transfer");
+        return open;
+    };
+
+    // least-buffered open stripe; parks when every stripe is above the mark
+    const pickChannel = async () => {
+        for (;;) {
+            const open = openPool();
+            let best = open[0];
+            for (const c of open) if (c.dc.bufferedAmount < best.dc.bufferedAmount) best = c;
+            if (best.dc.bufferedAmount <= HIGH_WATER) return best;
+            await new Promise((r) => { drainResolve = r; });
+        }
+    };
+
+    // files stream back to back as one byte range — offsets are global
+    // (manifest order), chunks fan out over every open stripe, and nothing
+    // waits per file: completion is the receiver's side of the ledger.
     const startStreaming = async () => {
         t0.v = Date.now();
         let sent = 0;
-        for (let i = 0; i < files.length; i++) {
-            const f = files[i];
-            dc.send(jframe({ t: "file", i, name: f.name, size: f.size }));
-            let offset = 0;
-            for await (const chunk of createReadStream(f.path, { highWaterMark: chunkSize })) {
-                if (dc.readyState !== "open") die("\nconnection lost mid-transfer");
-                if (dc.bufferedAmount > HIGH_WATER) {
-                    await new Promise((r) => { drainResolve = r; });
+        let base = 0;
+        for (const f of files) {
+            let local = 0;
+            for await (const block of createReadStream(f.path, { highWaterMark: 4 * 1024 * 1024 })) {
+                for (let p = 0; p < block.length; p += chunkSize) {
+                    const payload = block.subarray(p, p + chunkSize);
+                    const c = await pickChannel();
+                    c.used = true;
+                    c.dc.send(chunkFrame(base + local, payload));
+                    local += payload.length;
+                    sent += payload.length;
+                    progressLine("sending", sent, total, t0.v);
                 }
-                dc.send(chunkFrame(offset, chunk));
-                offset += chunk.length;
-                sent += chunk.length;
-                progressLine("sending", sent, total, t0.v);
             }
-            dc.send(jframe({ t: "file-end", i }));
-            await new Promise((r) => { gotResolve = r; }); // receiver confirmed
+            base += f.size;
         }
+    };
+
+    const addStripe = (k) => {
+        const pc = new RTCPeerConnection({ iceServers: [...STUN, ...turn] });
+        const c = { pc, dc: null, used: false };
+        conns[k] = c;
+        pc.onconnectionstatechange = () => {
+            dbg?.(`send stripe ${k} pc: ${pc.connectionState}`);
+            if (pc.connectionState === "failed" && c.used) die("\nstripe connection lost mid-transfer");
+        };
+        const ch = pc.createDataChannel(`freedrop-${k}`, { ordered: true });
+        ch.binaryType = "arraybuffer";
+        ch.bufferedAmountLowThreshold = LOW_WATER;
+        ch.onbufferedamountlow = () => { drainResolve?.(); drainResolve = null; };
+        ch.onopen = () => { dbg?.(`send stripe ${k} dc open`); c.dc = ch; };
+        ch.onclose = () => dbg?.(`send stripe ${k} dc closed`);
+        ch.onerror = (e) => dbg?.(`send stripe ${k} dc error: ${e?.error ?? e}`);
+        pc.onicecandidate = (e) => {
+            if (e.candidate) room.send({ sid, t: "ice", conn: k, candidate: candJson(e.candidate) });
+        };
+        (async () => {
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+            room.send({ sid, t: "offer", conn: k, sdp: pc.localDescription.sdp, ice: turn });
+        })().catch(() => {}); // a stripe that never opens is not fatal
     };
 
     room.onmessage = (msg) => {
         if (msg.t === "hello" && !sid) {
             sid = msg.sid;
+            // stripes need native engines on both ends; werift ends say 1
+            const maxConns = native ? Math.min(msg.conns ?? 1, STRIPE_CONNS) : 1;
             status("receiver found, connecting…");
-            pc = new RTCPeerConnection({ iceServers: [...STUN, ...turn] });
+            const pc = new RTCPeerConnection({ iceServers: [...STUN, ...turn] });
+            const c0 = { pc, dc: null, used: true };
+            conns[0] = c0;
             watchConnection(pc, die);
             dc = pc.createDataChannel("freedrop", { ordered: true });
             dc.binaryType = "arraybuffer";
@@ -331,7 +413,6 @@ async function send(paths) {
                     streaming = true;
                     startStreaming().catch((e) => die(`\nsend failed: ${e.message}`));
                 }
-                else if (m.t === "got") { gotResolve?.(); gotResolve = null; }
                 else if (m.t === "done") {
                     const secs = ((Date.now() - t0.v) / 1000).toFixed(1);
                     status("");
@@ -341,8 +422,10 @@ async function send(paths) {
                     die("\nreceiver declined the transfer");
                 }
             };
-            dc.onopen = () =>
+            dc.onopen = () => {
+                c0.dc = dc;
                 dc.send(jframe({ t: "manifest", files: files.map(({ name, size }) => ({ name, size })) }));
+            };
             pc.onicecandidate = (e) => {
                 if (e.candidate) room.send({ sid, t: "ice", candidate: candJson(e.candidate) });
             };
@@ -352,13 +435,17 @@ async function send(paths) {
                 // TURN rides along so the receiving side gets a relay path too
                 room.send({ sid, t: "offer", sdp: pc.localDescription.sdp, ice: turn });
             })().catch((e) => die(`webrtc: ${e.message}`));
+            if (total >= STRIPE_MIN) {
+                for (let k = 1; k < maxConns; k++) addStripe(k);
+            }
         } else if (msg.sid !== sid) {
             // single-receiver semantics: whoever said hello first wins
         } else if (msg.t === "answer") {
-            chunkSize = chunkFor(msg.sdp);
-            pc.setRemoteDescription({ type: "answer", sdp: msg.sdp }).catch(() => {});
+            const k = msg.conn ?? 0;
+            if (k === 0) chunkSize = chunkFor(msg.sdp);
+            conns[k]?.pc.setRemoteDescription({ type: "answer", sdp: msg.sdp }).catch(() => {});
         } else if (msg.t === "ice") {
-            pc.addIceCandidate(msg.candidate).catch(() => {});
+            conns[msg.conn ?? 0]?.pc.addIceCandidate(msg.candidate).catch(() => {});
         }
     };
 }
@@ -373,14 +460,15 @@ async function receive(code) {
         .catch((e) => die(`cannot reach any rendezvous broker: ${e.message}`));
 
     const sid = randomBytes(8).toString("hex");
-    let pc = null;
-    let dc = null;
+    const pcs = []; // conn-index → { pc, ch, rx, last }
+    let dc = null; // control channel (connection 0)
     let manifest = null;
-    let current = null; // { stream, i, path, received }
-    let doneThrough = -1; // highest completed file index (replay guard)
+    let files = null; // ledger: { i, size, base, path, fh, opening, written, closing }
+    let completed = 0;
     let totalReceived = 0;
     let total = 0;
     let t0 = 0;
+    const taken = new Set(); // paths reserved before their files exist
 
     const offerTimer = setTimeout(
         () => die("no sender found — is `freedrop <files>` still running on the other side?"),
@@ -391,10 +479,11 @@ async function receive(code) {
     const freshPath = (name) => {
         const safe = basename(name);
         let p = join(outDir, safe);
-        for (let n = 1; existsSync(p); n++) {
+        for (let n = 1; existsSync(p) || taken.has(p); n++) {
             const dot = safe.lastIndexOf(".");
             p = join(outDir, dot > 0 ? `${safe.slice(0, dot)}(${n})${safe.slice(dot)}` : `${safe}(${n})`);
         }
+        taken.add(p);
         return p;
     };
 
@@ -408,33 +497,85 @@ async function receive(code) {
         status("");
         console.log(`✓ received ${fmtSize(totalReceived)} in ${secs}s`);
         setTimeout(() => {
-            try { pc?.close(); } catch {}
+            for (const c of pcs) { try { c?.pc.close(); } catch {} }
             room.close();
             process.exit(0);
         }, 300);
     };
 
-    const onFrame = (ev) => {
+    // ---- positional writes keyed by global offset --------------------------
+    // Chunks may arrive on any stripe in any relative order; each lands at
+    // its offset in a preallocated file. A file is done when every byte of
+    // it has been written — there are no per-file control frames.
+
+    const fileAt = (offset) => {
+        let lo = 0;
+        let hi = files.length - 1;
+        while (lo < hi) { // last file whose base ≤ offset (skips empty files)
+            const mid = (lo + hi + 1) >> 1;
+            if (files[mid].base <= offset) lo = mid;
+            else hi = mid - 1;
+        }
+        return files[lo];
+    };
+
+    const maybeClose = (f) => {
+        if (f.written !== f.size || f.closing) return;
+        f.closing = true;
+        f.opening.then(() => f.fh.close()).then(() => {
+            if (++completed === files.length) finish();
+        }).catch((e) => die(`\n${basename(f.path)}: ${e.message}`));
+    };
+
+    const onChunk = (offset, chunk) => {
+        const f = fileAt(offset);
+        const local = offset - f.base;
+        if (local + chunk.length > f.size) die("\ndata outside any file — aborting");
+        if (!f.opening) {
+            f.opening = open(f.path, "w").then(async (fh) => {
+                f.fh = fh;
+                await fh.truncate(f.size);
+            });
+        }
+        f.opening.then(() => f.fh.write(chunk, 0, chunk.length, local)).then(() => {
+            f.written += chunk.length;
+            maybeClose(f);
+        }).catch((e) => die(`\n${basename(f.path)}: ${e.message}`));
+        totalReceived += chunk.length;
+        progressLine("receiving", totalReceived, total, t0);
+    };
+
+    const onFrame = (c, ev) => {
         const { msg, chunk, offset } = parseFrame(ev.data);
         if (chunk) {
-            if (!current) return;
-            if (offset < current.received) return; // engine replayed a message
-            if (offset > current.received) die("\ndata gap in transfer — aborting");
-            current.stream.write(chunk);
-            current.received += chunk.length;
-            totalReceived += chunk.length;
-            progressLine("receiving", totalReceived, total, t0);
-            return;
+            if (offset <= c.last) return; // engine replayed a message
+            c.last = offset;
+            return onChunk(offset, chunk);
         }
         if (msg.t === "manifest") {
             if (manifest) return; // engines may replay events — accept once
             manifest = msg.files;
             total = manifest.reduce((n, f) => n + f.size, 0);
+            let base = 0;
+            files = manifest.map((f, i) => {
+                const entry = {
+                    i, size: f.size, base, path: freshPath(f.name),
+                    fh: null, opening: null, written: 0, closing: false,
+                };
+                base += f.size;
+                return entry;
+            });
             console.log(`incoming: ${manifest.length} file(s), ${fmtSize(total)}`);
             for (const f of manifest) console.log(`  ${basename(f.name)}  (${fmtSize(f.size)})`);
             const go = () => {
                 t0 = Date.now();
                 sendCtl({ t: "accept" });
+                // empty files get no chunks — create them right away
+                for (const f of files) {
+                    if (f.size > 0) continue;
+                    f.opening = open(f.path, "w").then((fh) => { f.fh = fh; });
+                    maybeClose(f);
+                }
             };
             if (flags.yes) return go();
             const rl = createInterface({ input: process.stdin, output: process.stderr });
@@ -446,53 +587,54 @@ async function receive(code) {
                 }
                 go();
             });
-        } else if (msg.t === "file") {
-            if (current || msg.i <= doneThrough) return; // replayed
-            const path = freshPath(msg.name);
-            current = { stream: createWriteStream(path), i: msg.i, path, received: 0 };
-        } else if (msg.t === "file-end") {
-            if (!current || current.i !== msg.i) return; // replayed
-            doneThrough = msg.i;
-            const done = current;
-            current = null;
-            if (done.received !== manifest[done.i].size) {
-                die(`\n${basename(done.path)}: got ${done.received} bytes, expected ${manifest[done.i].size}`);
-            }
-            done.stream.end(() => {
-                sendCtl({ t: "got", i: done.i });
-                if (done.i === manifest.length - 1) finish();
-            });
         }
     };
 
     room.onmessage = async (msg) => {
         if (msg.sid !== sid) return;
         if (msg.t === "offer") {
-            clearTimeout(offerTimer);
-            status("sender found, connecting…");
-            pc = new RTCPeerConnection({ iceServers: [...STUN, ...(msg.ice ?? []), ...turnExtra] });
-            watchConnection(pc, die);
+            const k = msg.conn ?? 0;
+            if (pcs[k]) return; // replayed offer
+            if (k === 0) {
+                clearTimeout(offerTimer);
+                status("sender found, connecting…");
+            }
+            const pc = new RTCPeerConnection({ iceServers: [...STUN, ...(msg.ice ?? []), ...turnExtra] });
+            const c = { pc, ch: null, rx: false, last: -1 };
+            pcs[k] = c;
+            if (k === 0) watchConnection(pc, die);
+            else pc.onconnectionstatechange = () => {
+                dbg?.(`recv stripe ${k} pc: ${pc.connectionState}`);
+                // a stripe that already delivered data dying means lost bytes
+                if (pc.connectionState === "failed" && c.rx) die("\nstripe connection lost mid-transfer");
+            };
             pc.ondatachannel = (e) => {
-                if (dc) return;
-                dc = e.channel;
-                dc.binaryType = "arraybuffer";
-                dc.onmessage = onFrame;
+                if (c.ch) return;
+                dbg?.(`recv conn ${k} dc arrived`);
+                c.ch = e.channel;
+                c.ch.binaryType = "arraybuffer";
+                c.ch.onclose = () => dbg?.(`recv conn ${k} dc closed`);
+                c.ch.onmessage = (ev) => {
+                    c.rx = true;
+                    onFrame(c, ev);
+                };
+                if (k === 0) dc = c.ch;
             };
             pc.onicecandidate = (e) => {
-                if (e.candidate) room.send({ sid, t: "ice", candidate: candJson(e.candidate) });
+                if (e.candidate) room.send({ sid, t: "ice", conn: k, candidate: candJson(e.candidate) });
             };
             (async () => {
                 await pc.setRemoteDescription({ type: "offer", sdp: msg.sdp });
                 const answer = await pc.createAnswer();
                 await pc.setLocalDescription(answer);
-                room.send({ sid, t: "answer", sdp: pc.localDescription.sdp });
+                room.send({ sid, t: "answer", conn: k, sdp: pc.localDescription.sdp });
             })().catch((e) => die(`webrtc: ${e.message}`));
         } else if (msg.t === "ice") {
-            pc?.addIceCandidate(msg.candidate).catch(() => {});
+            pcs[msg.conn ?? 0]?.pc.addIceCandidate(msg.candidate).catch(() => {});
         }
     };
 
-    room.send({ sid, t: "hello" });
+    room.send({ sid, t: "hello", conns: native ? STRIPE_CONNS : 1 });
 }
 
 // ---- dispatch ---------------------------------------------------------------

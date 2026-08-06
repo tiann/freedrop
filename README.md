@@ -105,14 +105,19 @@ mDNS local discovery for offline LANs.
 
 The CLI uses [node-datachannel](https://github.com/murat-dogan/node-datachannel)
 (native libdatachannel bindings — prebuilt for Linux/macOS/Windows on
-x64 and arm64): **~200 MB/s** measured CLI-to-CLI on loopback, and real
-congestion control for lossy wide-area paths. On platforms without a
-prebuilt binary it falls back to [werift](https://github.com/shinyoshiaki/werift-webrtc)
+x64 and arm64): **~430 MB/s** measured CLI-to-CLI on loopback, and real
+congestion control for lossy wide-area paths. One WebRTC connection is
+CPU-bound around ~220 MB/s (DTLS plus a syscall per packet), so transfers
+over 64 MB stripe across four connections when both ends support it —
+which also means four congestion windows instead of one on lossy paths.
+Small files pipeline back to back with no per-file round trip. On
+platforms without a prebuilt binary it falls back to
+[werift](https://github.com/shinyoshiaki/werift-webrtc)
 (pure JS, ~40–70 MB/s); `FREEDROP_RTC=js` forces the fallback. Browsers
 use their own native stacks. The two ends negotiate frame size per
-connection, and every data frame carries its in-file offset, so a
-misbehaving stack can be caught (duplicates dropped, gaps fatal) instead
-of corrupting the file.
+connection, and every data frame carries its offset, so a misbehaving
+stack can be caught (duplicates dropped, gaps fatal) instead of
+corrupting the file.
 
 ## Built on
 
