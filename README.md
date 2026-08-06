@@ -100,13 +100,26 @@ mDNS local discovery for offline LANs.
 - An offline LAN can't rendezvous (the brokers are on the internet), even
   though the transfer itself would stay local.
 
+## Speed
+
+The CLI uses [node-datachannel](https://github.com/murat-dogan/node-datachannel)
+(native libdatachannel bindings — prebuilt for Linux/macOS/Windows on
+x64 and arm64): **~200 MB/s** measured CLI-to-CLI on loopback, and real
+congestion control for lossy wide-area paths. On platforms without a
+prebuilt binary it falls back to [werift](https://github.com/shinyoshiaki/werift-webrtc)
+(pure JS, ~40–70 MB/s); `FREEDROP_RTC=js` forces the fallback. Browsers
+use their own native stacks. The two ends negotiate frame size per
+connection, and every data frame carries its in-file offset, so a
+misbehaving stack can be caught (duplicates dropped, gaps fatal) instead
+of corrupting the file.
+
 ## Built on
 
-[werift](https://github.com/shinyoshiaki/werift-webrtc) for WebRTC in
-Node — the only runtime dependency. The rendezvous layer (`signal.mjs`,
-~250 lines, zero deps) is shared with
-[tango-mirror](https://github.com/tiann/tango-mirror), where it signals
-remote Android screen mirroring the same way.
+[node-datachannel](https://github.com/murat-dogan/node-datachannel) with a
+[werift](https://github.com/shinyoshiaki/werift-webrtc) fallback for
+WebRTC in Node. The rendezvous layer (`signal.mjs`, ~250 lines, zero deps)
+is shared with [tango-mirror](https://github.com/tiann/tango-mirror),
+where it signals remote Android screen mirroring the same way.
 
 ## License
 

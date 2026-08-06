@@ -83,6 +83,8 @@ const listFiles = (files) => {
     }
 };
 
+// tag 1 = JSON control; tag 0 = file bytes + 8-byte in-file offset, which
+// lets the receiver drop engine-replayed duplicates and detect gaps
 const jframe = (obj) => {
     const body = enc.encode(JSON.stringify(obj));
     const out = new Uint8Array(1 + body.length);
@@ -90,10 +92,19 @@ const jframe = (obj) => {
     out.set(body, 1);
     return out;
 };
+const chunkFrame = (offset, payload) => {
+    const out = new Uint8Array(9 + payload.length);
+    new DataView(out.buffer).setBigUint64(1, BigInt(offset));
+    out.set(payload, 9);
+    return out;
+};
 const parseFrame = (data) => {
     const u8 = new Uint8Array(data);
     if (u8[0] === 1) return { msg: JSON.parse(dec.decode(u8.subarray(1))) };
-    return { chunk: u8.subarray(1) };
+    return {
+        offset: Number(new DataView(u8.buffer, u8.byteOffset).getBigUint64(1)),
+        chunk: u8.subarray(9),
+    };
 };
 
 const fatal = (text) => status(text, true);
@@ -171,22 +182,26 @@ function sendMode() {
         const stream = async () => {
             t0 = Date.now();
             let sent = 0;
+            // bigger frames for native/browser peers; werift (announces
+            // 64 KB) misbehaves near its cap, so it gets the proven 16 KB
+            const mms = pc.sctp?.maxMessageSize ?? 65536;
+            const chunkSize = mms <= 65536 ? 16 * 1024 : Math.min(mms, 256 * 1024) - 9;
             for (let i = 0; i < files.length; i++) {
                 const f = files[i];
                 dc.send(jframe({ t: "file", i, name: f.name, size: f.size }));
                 const reader = f.stream().getReader();
+                let offset = 0;
                 for (;;) {
                     const { done, value } = await reader.read();
                     if (done) break;
                     // reader chunks can be large; respect the message size cap
-                    for (let off = 0; off < value.length; off += CHUNK) {
+                    for (let off = 0; off < value.length; off += chunkSize) {
                         if (dc.bufferedAmount > HIGH_WATER) {
                             await new Promise((r) => { drainResolve = r; });
                         }
-                        const part = value.subarray(off, off + CHUNK);
-                        const framed = new Uint8Array(1 + part.length);
-                        framed.set(part, 1);
-                        dc.send(framed);
+                        const part = value.subarray(off, off + chunkSize);
+                        dc.send(chunkFrame(offset, part));
+                        offset += part.length;
                         sent += part.length;
                     }
                     status(T.sending(`${fmtSize(sent)} / ${fmtSize(total)}`));
@@ -254,6 +269,11 @@ async function receive(codeStr) {
     let total = 0;
     let received = 0;
     let t0 = 0;
+    // replay guards — engines can re-deliver messages under load
+    let inFile = false;
+    let fileIndex = -1;
+    let fileReceived = 0;
+    let doneThrough = -1;
     // per-file sink: File System Access API when available, memory otherwise
     let dirHandle = null;
     let writable = null;
@@ -289,8 +309,12 @@ async function receive(codeStr) {
     };
 
     const onFrame = (ev) => {
-        const { msg, chunk } = parseFrame(ev.data);
+        const { msg, chunk, offset } = parseFrame(ev.data);
         if (chunk) {
+            if (!inFile) return;
+            if (offset < fileReceived) return; // engine replayed a message
+            if (offset > fileReceived) return fatal("data gap in transfer — aborting");
+            fileReceived += chunk.length;
             // copy (the DataChannel buffer gets reused under us) and queue on
             // the chain so the sink decision happens after openSink() ran
             const copy = chunk.slice();
@@ -301,6 +325,7 @@ async function receive(codeStr) {
             return;
         }
         if (msg.t === "manifest") {
+            if (manifest) return; // replayed
             manifest = msg.files;
             total = manifest.reduce((n, f) => n + f.size, 0);
             listFiles(manifest);
@@ -326,8 +351,15 @@ async function receive(codeStr) {
             };
             $("actions").appendChild(btn);
         } else if (msg.t === "file") {
+            if (inFile || msg.i <= doneThrough) return; // replayed
+            inFile = true;
+            fileIndex = msg.i;
+            fileReceived = 0;
             writeChain = writeChain.then(() => openSink(msg.name));
         } else if (msg.t === "file-end") {
+            if (!inFile || msg.i !== fileIndex) return; // replayed
+            inFile = false;
+            doneThrough = msg.i;
             const last = msg.i === manifest.length - 1;
             writeChain = writeChain.then(async () => {
                 await closeSink();

@@ -33,6 +33,7 @@
     "node": ">=22"
   },
   "dependencies": {
+    "node-datachannel": "^0.32.3",
     "qrcode-terminal": "^0.12.0",
     "werift": "^0.24.3"
   }

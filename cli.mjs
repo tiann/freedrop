@@ -11,18 +11,10 @@ import { createReadStream, createWriteStream, existsSync, statSync } from "node:
 import { basename, join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { createInterface } from "node:readline";
-import { RTCPeerConnection } from "werift";
 import qrcode from "qrcode-terminal";
 import { SignalRoom, b64u, DEFAULT_BROKERS } from "./signal.mjs";
 
 const PAGE = process.env.FREEDROP_PAGE ?? "https://weishu.me/freedrop/";
-// Benchmarked against werift (100 MB, loopback): 16 KB chunks + 4 MB
-// water marks run 67 MB/s; 64 KB chunks drop to 47 MB/s (its large-message
-// fragmentation path is slower) and deeper buffers only add queue delay.
-// Note werift rejects messages over 65536 bytes outright — frame included.
-const CHUNK = 16 * 1024;
-const HIGH_WATER = 4 * 1024 * 1024; // pause the reader above this
-const LOW_WATER = 1 * 1024 * 1024;  // resume below this
 
 const STUN = [
     { urls: "stun:stun.cloudflare.com:3478" },
@@ -91,7 +83,72 @@ if (typeof WebSocket === "undefined") {
     process.exit(1);
 }
 
-// ---- TURN (same three no-nonsense forms as tango-mirror, minus the relay) --
+// ---- WebRTC engine ----------------------------------------------------------
+// node-datachannel (libdatachannel bindings): native SCTP with real
+// congestion control — this is what makes transfers run at line rate.
+// werift (pure JS, ~65 MB/s ceiling and textbook loss recovery) stays as
+// the fallback for platforms without a prebuilt binary; FREEDROP_RTC=js
+// forces it, which the interop tests use.
+
+let native = false;
+const RTCPeerConnection = await (async () => {
+    if (process.env.FREEDROP_RTC !== "js") {
+        try {
+            const { RTCPeerConnection: PC } = await import("node-datachannel/polyfill");
+            native = true;
+            return PC;
+        } catch {}
+    }
+    const { RTCPeerConnection: WeriftPC } = await import("werift");
+    // dress werift's observable API up as the standard browser one, so the
+    // transfer code below has a single shape to talk to. Guards throughout:
+    // werift can re-emit channel/open events, and double subscriptions
+    // silently duplicate an entire transfer.
+    const wrapChannel = (ch) => {
+        if (ch.__wrapped) return ch;
+        ch.__wrapped = true;
+        let opened = false;
+        ch.onMessage.subscribe((data) => ch.onmessage?.({ data }));
+        ch.stateChanged.subscribe((st) => {
+            if (st === "open" && !opened) {
+                opened = true;
+                ch.onopen?.();
+            }
+        });
+        ch.bufferedAmountLow.subscribe(() => ch.onbufferedamountlow?.());
+        return ch;
+    };
+    return class extends WeriftPC {
+        constructor(config) {
+            super(config);
+            this.onIceCandidate.subscribe((c) => this.onicecandidate?.({ candidate: c ?? null }));
+            this.onDataChannel.subscribe((ch) => this.ondatachannel?.({ channel: wrapChannel(ch) }));
+            this.connectionStateChange.subscribe(() => this.onconnectionstatechange?.());
+        }
+        createDataChannel(label, opts) {
+            return wrapChannel(super.createDataChannel(label, opts));
+        }
+    };
+})();
+
+// The peer announces its message-size limit in the SDP. Big frames mean
+// fewer JS boundary crossings — but werift (announces exactly 65536, vs
+// 256 KB+ for browsers and libdatachannel) crashes or duplicates data on
+// messages near its cap, so any werift end pins the proven 16 KB payload.
+const chunkFor = (remoteSdp) => {
+    if (!native) return 16 * 1024;
+    const m = /a=max-message-size:(\d+)/.exec(remoteSdp);
+    const remote = m ? Number(m[1]) : 65536;
+    if (remote <= 65536) return 16 * 1024;
+    return Math.min(remote, 256 * 1024) - 9; // 9-byte frame header
+};
+const HIGH_WATER = native ? 16 * 1024 * 1024 : 4 * 1024 * 1024;
+const LOW_WATER = HIGH_WATER / 4;
+
+const candJson = (c) =>
+    c.toJSON ? c.toJSON() : { candidate: c.candidate, sdpMid: c.sdpMid, sdpMLineIndex: c.sdpMLineIndex };
+
+// ---- TURN (same forms as tango-mirror, minus the relay) ---------------------
 
 async function turnServers() {
     const t = flags.turn;
@@ -137,16 +194,26 @@ async function turnServers() {
     process.exit(1);
 }
 
-// ---- wire framing: every DataChannel message is binary, 1-byte tag ---------
-// 1 = UTF-8 JSON control message, 0 = file bytes. Explicit tagging sidesteps
-// the string/binary typing differences between browsers and werift.
+// ---- wire framing -----------------------------------------------------------
+// Every DataChannel message is binary. Tag 1 = UTF-8 JSON control message;
+// tag 0 = file bytes, followed by the 8-byte in-file offset. The offset
+// lets the receiver drop duplicates — werift's receive path replays
+// messages under load — and hard-detects gaps instead of writing a
+// corrupted file. It is also the foundation for resume later.
 
 const jframe = (obj) => Buffer.concat([Buffer.from([1]), Buffer.from(JSON.stringify(obj))]);
+
+function chunkFrame(offset, payload) {
+    const head = Buffer.alloc(9);
+    head[0] = 0;
+    head.writeBigUInt64BE(BigInt(offset), 1);
+    return Buffer.concat([head, payload]);
+}
 
 function parseFrame(data) {
     const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
     if (buf[0] === 1) return { msg: JSON.parse(buf.subarray(1).toString()) };
-    return { chunk: buf.subarray(1) };
+    return { offset: Number(buf.readBigUInt64BE(1)), chunk: buf.subarray(9) };
 }
 
 // ---- progress + formatting --------------------------------------------------
@@ -159,7 +226,7 @@ const fmtSize = (n) =>
 
 const status = (line) => process.stderr.write(`\r\x1b[K${line}`);
 
-// redrawing per 64 KB chunk costs real throughput at 100+ MB/s — throttle
+// redrawing per chunk costs real throughput at these rates — throttle
 let lastDraw = 0;
 function progressLine(verb, done, total, t0) {
     const now = Date.now();
@@ -173,15 +240,15 @@ function progressLine(verb, done, total, t0) {
 
 // P2P failure is the one error users will actually hit — explain it
 function watchConnection(pc, onFatal) {
-    pc.connectionStateChange.subscribe((state) => {
-        if (state === "failed") {
+    pc.onconnectionstatechange = () => {
+        if (pc.connectionState === "failed") {
             onFatal(
                 "\nWebRTC could not connect (symmetric NAT or CGNAT on both ends?).\n" +
                 "Retry with a TURN relay on the SENDING side: --turn cloudflare\n" +
                 "(free 1 TB/month — see the README)",
             );
         }
-    });
+    };
 }
 
 const die = (msg) => {
@@ -212,6 +279,7 @@ async function send(paths) {
     let sid = null;
     let pc = null;
     let dc = null;
+    let chunkSize = 16 * 1024 - 1;
     let drainResolve = null;
     let gotResolve = null;
     const t0 = { v: 0 };
@@ -228,12 +296,14 @@ async function send(paths) {
         for (let i = 0; i < files.length; i++) {
             const f = files[i];
             dc.send(jframe({ t: "file", i, name: f.name, size: f.size }));
-            for await (const chunk of createReadStream(f.path, { highWaterMark: CHUNK })) {
+            let offset = 0;
+            for await (const chunk of createReadStream(f.path, { highWaterMark: chunkSize })) {
                 if (dc.readyState !== "open") die("\nconnection lost mid-transfer");
                 if (dc.bufferedAmount > HIGH_WATER) {
                     await new Promise((r) => { drainResolve = r; });
                 }
-                dc.send(Buffer.concat([Buffer.from([0]), chunk]));
+                dc.send(chunkFrame(offset, chunk));
+                offset += chunk.length;
                 sent += chunk.length;
                 progressLine("sending", sent, total, t0.v);
             }
@@ -249,12 +319,18 @@ async function send(paths) {
             pc = new RTCPeerConnection({ iceServers: [...STUN, ...turn] });
             watchConnection(pc, die);
             dc = pc.createDataChannel("freedrop", { ordered: true });
+            dc.binaryType = "arraybuffer";
             dc.bufferedAmountLowThreshold = LOW_WATER;
-            dc.bufferedAmountLow.subscribe(() => { drainResolve?.(); drainResolve = null; });
-            dc.onMessage.subscribe((data) => {
-                const { msg: m } = parseFrame(data);
+            dc.onbufferedamountlow = () => { drainResolve?.(); drainResolve = null; };
+            let streaming = false;
+            dc.onmessage = (ev) => {
+                const { msg: m } = parseFrame(ev.data);
                 if (!m) return;
-                if (m.t === "accept") startStreaming().catch((e) => die(`\nsend failed: ${e.message}`));
+                if (m.t === "accept") {
+                    if (streaming) return; // duplicate accept must not restart
+                    streaming = true;
+                    startStreaming().catch((e) => die(`\nsend failed: ${e.message}`));
+                }
                 else if (m.t === "got") { gotResolve?.(); gotResolve = null; }
                 else if (m.t === "done") {
                     const secs = ((Date.now() - t0.v) / 1000).toFixed(1);
@@ -264,13 +340,12 @@ async function send(paths) {
                 } else if (m.t === "reject") {
                     die("\nreceiver declined the transfer");
                 }
-            });
-            dc.stateChanged.subscribe((st) => {
-                if (st === "open") dc.send(jframe({ t: "manifest", files: files.map(({ name, size }) => ({ name, size })) }));
-            });
-            pc.onIceCandidate.subscribe((c) => {
-                if (c) room.send({ sid, t: "ice", candidate: c.toJSON() });
-            });
+            };
+            dc.onopen = () =>
+                dc.send(jframe({ t: "manifest", files: files.map(({ name, size }) => ({ name, size })) }));
+            pc.onicecandidate = (e) => {
+                if (e.candidate) room.send({ sid, t: "ice", candidate: candJson(e.candidate) });
+            };
             (async () => {
                 const offer = await pc.createOffer();
                 await pc.setLocalDescription(offer);
@@ -280,6 +355,7 @@ async function send(paths) {
         } else if (msg.sid !== sid) {
             // single-receiver semantics: whoever said hello first wins
         } else if (msg.t === "answer") {
+            chunkSize = chunkFor(msg.sdp);
             pc.setRemoteDescription({ type: "answer", sdp: msg.sdp }).catch(() => {});
         } else if (msg.t === "ice") {
             pc.addIceCandidate(msg.candidate).catch(() => {});
@@ -300,7 +376,8 @@ async function receive(code) {
     let pc = null;
     let dc = null;
     let manifest = null;
-    let current = null; // { stream, i, received }
+    let current = null; // { stream, i, path, received }
+    let doneThrough = -1; // highest completed file index (replay guard)
     let totalReceived = 0;
     let total = 0;
     let t0 = 0;
@@ -321,6 +398,10 @@ async function receive(code) {
         return p;
     };
 
+    // the manifest only ever arrives over the DataChannel, so any reply
+    // here is guaranteed an open channel
+    const sendCtl = (obj) => dc.send(jframe(obj));
+
     const finish = () => {
         sendCtl({ t: "done" });
         const secs = ((Date.now() - t0) / 1000).toFixed(1);
@@ -333,10 +414,12 @@ async function receive(code) {
         }, 300);
     };
 
-    const onFrame = (data) => {
-        const { msg, chunk } = parseFrame(data);
+    const onFrame = (ev) => {
+        const { msg, chunk, offset } = parseFrame(ev.data);
         if (chunk) {
             if (!current) return;
+            if (offset < current.received) return; // engine replayed a message
+            if (offset > current.received) die("\ndata gap in transfer — aborting");
             current.stream.write(chunk);
             current.received += chunk.length;
             totalReceived += chunk.length;
@@ -344,6 +427,7 @@ async function receive(code) {
             return;
         }
         if (msg.t === "manifest") {
+            if (manifest) return; // engines may replay events — accept once
             manifest = msg.files;
             total = manifest.reduce((n, f) => n + f.size, 0);
             console.log(`incoming: ${manifest.length} file(s), ${fmtSize(total)}`);
@@ -363,11 +447,17 @@ async function receive(code) {
                 go();
             });
         } else if (msg.t === "file") {
+            if (current || msg.i <= doneThrough) return; // replayed
             const path = freshPath(msg.name);
             current = { stream: createWriteStream(path), i: msg.i, path, received: 0 };
         } else if (msg.t === "file-end") {
+            if (!current || current.i !== msg.i) return; // replayed
+            doneThrough = msg.i;
             const done = current;
             current = null;
+            if (done.received !== manifest[done.i].size) {
+                die(`\n${basename(done.path)}: got ${done.received} bytes, expected ${manifest[done.i].size}`);
+            }
             done.stream.end(() => {
                 sendCtl({ t: "got", i: done.i });
                 if (done.i === manifest.length - 1) finish();
@@ -375,24 +465,22 @@ async function receive(code) {
         }
     };
 
-    // the manifest only ever arrives over the DataChannel, so any reply
-    // here is guaranteed an open channel
-    const sendCtl = (obj) => dc.send(jframe(obj));
-
-    room.onmessage = (msg) => {
+    room.onmessage = async (msg) => {
         if (msg.sid !== sid) return;
         if (msg.t === "offer") {
             clearTimeout(offerTimer);
             status("sender found, connecting…");
             pc = new RTCPeerConnection({ iceServers: [...STUN, ...(msg.ice ?? []), ...turnExtra] });
             watchConnection(pc, die);
-            pc.onDataChannel.subscribe((channel) => {
-                dc = channel;
-                dc.onMessage.subscribe(onFrame);
-            });
-            pc.onIceCandidate.subscribe((c) => {
-                if (c) room.send({ sid, t: "ice", candidate: c.toJSON() });
-            });
+            pc.ondatachannel = (e) => {
+                if (dc) return;
+                dc = e.channel;
+                dc.binaryType = "arraybuffer";
+                dc.onmessage = onFrame;
+            };
+            pc.onicecandidate = (e) => {
+                if (e.candidate) room.send({ sid, t: "ice", candidate: candJson(e.candidate) });
+            };
             (async () => {
                 await pc.setRemoteDescription({ type: "offer", sdp: msg.sdp });
                 const answer = await pc.createAnswer();
