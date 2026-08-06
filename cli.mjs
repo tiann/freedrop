@@ -6,11 +6,22 @@
 // exchange WebRTC SDP/ICE there. The file bytes travel exclusively over
 // the WebRTC DataChannel: direct P2P, DTLS-encrypted, never through any
 // server. TURN (--turn) is the opt-in relay for NATs P2P can't punch.
+//
+// Transfers are resumable and verified. The receiver stages each file as
+// <name>.part and journals the byte ranges already on disk in
+// <name>.part.state; any re-negotiation — the same processes after a
+// network blip, or fresh runs (`freedrop <code>` to receive again,
+// `freedrop --code <code> <files>` to send again) — picks up from the
+// journal and transfers only what is missing. A file is renamed into
+// place only after its content matches the sender's hash.
 
-import { createReadStream, existsSync, statSync } from "node:fs";
+import {
+    createReadStream, existsSync, statSync, readdirSync, readFileSync,
+    writeFileSync, renameSync, rmSync,
+} from "node:fs";
 import { open } from "node:fs/promises";
 import { basename, join } from "node:path";
-import { randomBytes } from "node:crypto";
+import { randomBytes, createHash } from "node:crypto";
 import { createInterface } from "node:readline";
 import qrcode from "qrcode-terminal";
 import { SignalRoom, b64u, DEFAULT_BROKERS } from "./signal.mjs";
@@ -32,6 +43,8 @@ Usage:
 Options:
   -y, --yes             receive without asking
   -o, --out <dir>       save received files here     (default current dir)
+      --code <code>     send with a fixed code — resumes an interrupted
+                        send: the receiver keeps its partial data
       --turn <target>   TURN relay for NATs P2P can't punch: "cloudflare"
                         (reads CF_TURN_KEY_ID + CF_TURN_API_TOKEN) or a
                         turn:/turns: URL used with --turn-auth
@@ -41,7 +54,8 @@ Options:
   -h, --help            show this help
   -v, --version         show version
 
-The receiver can also be any browser: the sender prints a link.
+Interrupted transfers resume: re-run the same receive command (and, if the
+sender died too, re-send with --code and the same files).
 Docs: https://github.com/tiann/freedrop`;
 
 // ---- tiny arg parser -------------------------------------------------------
@@ -65,6 +79,7 @@ const rest = [];
         } else if (a === "-y" || a === "--yes") flags.yes = true;
         else if (a === "--no-qr") flags.noQr = true;
         else if (a === "-o" || a === "--out") flags.out = argv[++i];
+        else if (a === "--code") flags.code = argv[++i];
         else if (a === "--turn") flags.turn = argv[++i];
         else if (a === "--turn-auth") flags.turnAuth = argv[++i];
         else if (a === "--broker") flags.broker = argv[++i];
@@ -127,6 +142,7 @@ const RTCPeerConnection = await (async () => {
                 opened = true;
                 ch.onopen?.();
             }
+            if (st === "closed") ch.onclose?.();
         });
         ch.bufferedAmountLow.subscribe(() => ch.onbufferedamountlow?.());
         return ch;
@@ -167,6 +183,10 @@ const LOW_WATER = HIGH_WATER / 4;
 // werift, whose engine can't be trusted under a striped flood).
 const STRIPE_CONNS = 4;
 const STRIPE_MIN = 64 * 1024 * 1024;
+
+// how long the accepted side keeps re-negotiating before giving up (the
+// journal survives either way — a later run resumes)
+const RETRY_WINDOW = 90_000;
 
 const candJson = (c) =>
     c.toJSON ? c.toJSON() : { candidate: c.candidate, sdpMid: c.sdpMid, sdpMLineIndex: c.sdpMLineIndex };
@@ -222,8 +242,13 @@ async function turnServers() {
 // tag 0 = file bytes, followed by an 8-byte offset into the transfer's
 // global byte range (files concatenated in manifest order). The offset
 // lets chunks land positionally from any stripe, lets the receiver drop
-// duplicates — werift's receive path replays messages under load, and a
-// channel's offsets only ever grow — and is the foundation for resume.
+// duplicates (werift's receive path replays messages under load), and is
+// what makes resume a matter of bookkeeping: "what I have" is a set of
+// offset ranges, and only the complement travels.
+//
+// Control frames: manifest {files:[{name,size,mtime}]} → accept {have} →
+// (data) → hash {i,sha} per file → eof → more {have} if gaps remain →
+// done. `have` is a list of [start,end) ranges in global offsets.
 
 const jframe = (obj) => Buffer.concat([Buffer.from([1]), Buffer.from(JSON.stringify(obj))]);
 
@@ -238,6 +263,93 @@ function parseFrame(data) {
     const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
     if (buf[0] === 1) return { msg: JSON.parse(buf.subarray(1).toString()) };
     return { offset: Number(buf.readBigUInt64BE(1)), chunk: buf.subarray(9) };
+}
+
+// ---- offset ranges ----------------------------------------------------------
+// Sorted, disjoint [start,end) intervals. Chunks arrive nearly in order
+// per channel, so a transfer's coverage is a handful of intervals — the
+// journal stays tiny no matter the file size.
+
+function addRange(rs, s, e) {
+    let i = 0;
+    while (i < rs.length && rs[i][1] < s) i++;
+    let removed = 0;
+    let j = i;
+    while (j < rs.length && rs[j][0] <= e) {
+        removed += rs[j][1] - rs[j][0];
+        s = Math.min(s, rs[j][0]);
+        e = Math.max(e, rs[j][1]);
+        j++;
+    }
+    rs.splice(i, j - i, [s, e]);
+    return e - s - removed; // bytes newly covered
+}
+
+const coveredBytes = (rs) => rs.reduce((n, [s, e]) => n + (e - s), 0);
+
+function complement(rs, total) {
+    const out = [];
+    let p = 0;
+    for (const [s, e] of rs) {
+        if (s > p) out.push([p, s]);
+        p = Math.max(p, e);
+    }
+    if (p < total) out.push([p, total]);
+    return out;
+}
+
+// ranges from the wire or a journal are untrusted — clamp and re-merge
+function cleanRanges(raw, max) {
+    const rs = [];
+    for (const r of Array.isArray(raw) ? raw : []) {
+        const s = Number(r?.[0]);
+        const e = Number(r?.[1]);
+        if (Number.isSafeInteger(s) && Number.isSafeInteger(e) && s >= 0 && s < e && e <= max) {
+            addRange(rs, s, e);
+        }
+    }
+    return rs;
+}
+
+// ---- content hash -----------------------------------------------------------
+// fdhash(file) = sha256(sha256(block₀) ‖ sha256(block₁) ‖ …), 4 MiB
+// blocks. Chosen over a plain sha256 stream because browsers have no
+// incremental digest — both ends can compute this shape, either end can
+// stream it. The sender hashes while reading, the receiver re-reads the
+// staged file once at the end; a mismatch (bit rot, or the sender's file
+// changed between resume runs) is fatal before the file is renamed into
+// place.
+
+const HASH_BLOCK = 4 * 1024 * 1024;
+
+class BlockHasher {
+    #digests = [];
+    #cur = null;
+    #fill = 0;
+    update(buf) {
+        let off = 0;
+        while (off < buf.length) {
+            if (!this.#cur) {
+                this.#cur = createHash("sha256");
+                this.#fill = 0;
+            }
+            const take = Math.min(HASH_BLOCK - this.#fill, buf.length - off);
+            this.#cur.update(buf.subarray(off, off + take));
+            this.#fill += take;
+            off += take;
+            if (this.#fill === HASH_BLOCK) {
+                this.#digests.push(this.#cur.digest());
+                this.#cur = null;
+            }
+        }
+    }
+    digest() {
+        if (this.#cur) {
+            this.#digests.push(this.#cur.digest());
+            this.#cur = null;
+        }
+        return createHash("sha256").update(Buffer.concat(this.#digests)).digest("hex");
+    }
 }
 
 // ---- progress + formatting --------------------------------------------------
@@ -262,18 +374,11 @@ function progressLine(verb, done, total, t0) {
     status(`${verb}${pct}  ${fmtSize(done)} / ${fmtSize(total)}${rate}`);
 }
 
-// P2P failure is the one error users will actually hit — explain it
-function watchConnection(pc, onFatal) {
-    pc.onconnectionstatechange = () => {
-        if (pc.connectionState === "failed") {
-            onFatal(
-                "\nWebRTC could not connect (symmetric NAT or CGNAT on both ends?).\n" +
-                "Retry with a TURN relay on the SENDING side: --turn cloudflare\n" +
-                "(free 1 TB/month — see the README)",
-            );
-        }
-    };
-}
+// P2P failure before any data is the one error fresh users hit — explain it
+const NAT_HINT =
+    "\nWebRTC could not connect (symmetric NAT or CGNAT on both ends?).\n" +
+    "Retry with a TURN relay on the SENDING side: --turn cloudflare\n" +
+    "(free 1 TB/month — see the README)";
 
 const die = (msg) => {
     console.error(msg);
@@ -282,12 +387,37 @@ const die = (msg) => {
 
 const dbg = process.env.FREEDROP_DEBUG ? (...a) => console.error("\n[dbg]", ...a) : null;
 
+const shellQuote = (s) => (/^[\w./+=:,-]+$/.test(s) ? s : `'${s.replaceAll("'", "'\\''")}'`);
+
+const ABORT = Symbol("attempt aborted");
+
 // ---- send -------------------------------------------------------------------
+// The sender is a loop of attempts: each receiver hello gets a fresh set
+// of connections, a manifest, and — after accept {have} — a single
+// sequential read of every file that hashes everything and transmits
+// only the missing ranges. A dead receiver is not fatal; the room stays
+// open and the next hello (same process re-run with `freedrop <code>`,
+// or the same one reconnecting) starts a new attempt that resumes.
 
 async function send(paths) {
-    const files = paths.map((p) => ({ path: p, name: basename(p), size: statSync(p).size }));
+    const files = paths.map((p) => {
+        const st = statSync(p);
+        return { path: p, name: basename(p), size: st.size, mtime: Math.round(st.mtimeMs) };
+    });
     const total = files.reduce((n, f) => n + f.size, 0);
-    const key = randomBytes(32);
+    const bases = [];
+    {
+        let b = 0;
+        for (const f of files) {
+            bases.push(b);
+            b += f.size;
+        }
+    }
+    let key;
+    if (flags.code) {
+        if (!looksLikeCode(flags.code)) die("--code: not a freedrop code");
+        key = Buffer.from(b64u.decode(flags.code));
+    } else key = randomBytes(32);
     const code = b64u.encode(new Uint8Array(key));
     const turn = await turnServers();
 
@@ -302,155 +432,303 @@ async function send(paths) {
     if (!flags.noQr) qrcode.generate(link, { small: true }, (art) => console.log(art));
     console.log("waiting for receiver…  (Ctrl-C to cancel)");
 
-    let sid = null;
-    let dc = null; // control channel (connection 0)
-    let chunkSize = 16 * 1024 - 1;
-    let drainResolve = null;
+    let at = null; // current attempt
+    let acceptedEver = false;
+    let done = false;
     const t0 = { v: 0 };
-    // conns[k]: one WebRTC connection per stripe; conns[0] also carries
-    // control. A stripe joins the pool when its channel opens; one that
-    // dies unused is just ignored, one that dies after carrying data
-    // aborts the transfer — its bytes may be gone.
-    const conns = [];
 
-    const cleanupAndExit = (code_) => {
-        for (const c of conns) { try { c?.pc.close(); } catch {} }
-        room.close();
-        process.exit(code_);
+    process.on("SIGINT", () => {
+        if (acceptedEver && !done) {
+            console.error(
+                "\ninterrupted — the receiver keeps its partial data.\nresume with:\n" +
+                `  freedrop --code ${code} ${paths.map(shellQuote).join(" ")}`,
+            );
+        }
+        try { room.close(); } catch {}
+        process.exit(130);
+    });
+
+    const teardown = (a) => {
+        if (!a) return;
+        a.dead = true;
+        a.drainResolve?.();
+        a.drainResolve = null;
+        for (const c of a.conns) { try { c?.pc.close(); } catch {} }
     };
 
-    const openPool = () => {
-        const open = [];
-        for (const c of conns) {
+    const sendCtl = (a, obj) => {
+        try { a.conns[0].dc.send(jframe(obj)); } catch {}
+    };
+
+    const openPool = (a) => {
+        const open_ = [];
+        for (const c of a.conns) {
             if (!c) continue;
-            if (c.dc?.readyState === "open") open.push(c);
-            else if (c.used) die("\nconnection lost mid-transfer");
+            if (c.dc?.readyState === "open") open_.push(c);
+            else if (c.used) { // a stripe that carried data died — its bytes may be gone
+                teardown(a);
+                throw ABORT;
+            }
         }
-        if (!open.length) die("\nconnection lost mid-transfer");
-        return open;
+        if (!open_.length) {
+            teardown(a);
+            throw ABORT;
+        }
+        return open_;
     };
 
-    // least-buffered open stripe; parks when every stripe is above the mark
-    const pickChannel = async () => {
+    // least-buffered open stripe; parks when every stripe is above the
+    // mark. The park has a timeout: werift does not always report a dead
+    // peer, so we re-check the pool instead of trusting the drain event.
+    const pickChannel = async (a) => {
         for (;;) {
-            const open = openPool();
-            let best = open[0];
-            for (const c of open) if (c.dc.bufferedAmount < best.dc.bufferedAmount) best = c;
+            if (a.dead) throw ABORT;
+            const open_ = openPool(a);
+            let best = open_[0];
+            for (const c of open_) if (c.dc.bufferedAmount < best.dc.bufferedAmount) best = c;
             if (best.dc.bufferedAmount <= HIGH_WATER) return best;
-            await new Promise((r) => { drainResolve = r; });
+            await new Promise((r) => {
+                a.drainResolve = r;
+                const t = setTimeout(r, 5000);
+                t.unref?.();
+            });
         }
     };
 
-    // files stream back to back as one byte range — offsets are global
-    // (manifest order), chunks fan out over every open stripe, and nothing
-    // waits per file: completion is the receiver's side of the ledger.
-    const startStreaming = async () => {
+    const sendChunk = (a, c, offset, payload) => {
+        try {
+            c.used = true;
+            c.dc.send(chunkFrame(offset, payload));
+        } catch {
+            teardown(a);
+            throw ABORT;
+        }
+    };
+
+    // one sequential pass over every file: hash every block (resume needs
+    // fresh hashes — the file may have changed since the last run), send
+    // only chunks that intersect the missing ranges. Reading skipped
+    // ranges costs disk speed, which the network never notices.
+    const streamAll = async (a, have) => {
+        const missing = complement(cleanRanges(have, total), total);
+        const need = missing.reduce((n, [s, e]) => n + (e - s), 0);
+        if (need < total) status(`resuming — ${fmtSize(total - need)} already delivered\n`);
         t0.v = Date.now();
         let sent = 0;
-        let base = 0;
-        for (const f of files) {
+        let mi = 0;
+        for (let fi = 0; fi < files.length; fi++) {
+            const f = files[fi];
+            const hasher = new BlockHasher();
             let local = 0;
-            for await (const block of createReadStream(f.path, { highWaterMark: 4 * 1024 * 1024 })) {
-                for (let p = 0; p < block.length; p += chunkSize) {
-                    const payload = block.subarray(p, p + chunkSize);
-                    const c = await pickChannel();
-                    c.used = true;
-                    c.dc.send(chunkFrame(base + local, payload));
-                    local += payload.length;
-                    sent += payload.length;
-                    progressLine("sending", sent, total, t0.v);
+            if (f.size > 0) {
+                for await (const block of createReadStream(f.path, { highWaterMark: 4 * 1024 * 1024 })) {
+                    if (a.dead) throw ABORT;
+                    hasher.update(block);
+                    const gs = bases[fi] + local;
+                    const ge = gs + block.length;
+                    while (mi < missing.length && missing[mi][1] <= gs) mi++;
+                    for (let j = mi; j < missing.length && missing[j][0] < ge; j++) {
+                        const s = Math.max(gs, missing[j][0]);
+                        const e = Math.min(ge, missing[j][1]);
+                        for (let p = s; p < e; p += a.chunkSize) {
+                            const q = Math.min(e, p + a.chunkSize);
+                            const c = await pickChannel(a);
+                            sendChunk(a, c, p, block.subarray(p - gs, q - gs));
+                            sent += q - p;
+                            progressLine("sending", sent, need, t0.v);
+                        }
+                    }
+                    local += block.length;
                 }
             }
-            base += f.size;
+            if (local !== f.size) die(`\n${f.name}: size changed while sending — re-run to restart`);
+            sendCtl(a, { t: "hash", i: fi, sha: hasher.digest() });
         }
+        sendCtl(a, { t: "eof" });
+        status("waiting for the receiver to verify…");
     };
 
-    const addStripe = (k) => {
+    const fileIndexAt = (off) => {
+        let lo = 0;
+        let hi = files.length - 1;
+        while (lo < hi) { // last file whose base ≤ off (skips empty files)
+            const mid = (lo + hi + 1) >> 1;
+            if (bases[mid] <= off) lo = mid;
+            else hi = mid - 1;
+        }
+        return lo;
+    };
+
+    // gap fill after eof: an engine dropped messages. Rare and small —
+    // positioned reads, no re-hash (this attempt already sent hashes).
+    const streamMore = async (a, have) => {
+        const missing = complement(cleanRanges(have, total), total);
+        for (const [s, e] of missing) {
+            let p = s;
+            while (p < e) {
+                const fi = fileIndexAt(p);
+                const f = files[fi];
+                const end = Math.min(e, bases[fi] + f.size);
+                const fh = await open(f.path, "r");
+                try {
+                    for (let q = p; q < end; q += a.chunkSize) {
+                        if (a.dead) throw ABORT;
+                        const r = Math.min(end, q + a.chunkSize);
+                        const buf = Buffer.alloc(r - q);
+                        await fh.read(buf, 0, r - q, q - bases[fi]);
+                        const c = await pickChannel(a);
+                        sendChunk(a, c, q, buf);
+                    }
+                } finally {
+                    await fh.close();
+                }
+                p = end;
+            }
+        }
+        sendCtl(a, { t: "eof" });
+    };
+
+    const addStripe = (a, k) => {
         const pc = new RTCPeerConnection({ iceServers: [...STUN, ...turn] });
         const c = { pc, dc: null, used: false };
-        conns[k] = c;
+        a.conns[k] = c;
         pc.onconnectionstatechange = () => {
             dbg?.(`send stripe ${k} pc: ${pc.connectionState}`);
-            if (pc.connectionState === "failed" && c.used) die("\nstripe connection lost mid-transfer");
+            if (pc.connectionState === "failed" && c.used && !a.dead) {
+                teardown(a); // the streaming loop notices on its next chunk
+            }
         };
         const ch = pc.createDataChannel(`freedrop-${k}`, { ordered: true });
         ch.binaryType = "arraybuffer";
         ch.bufferedAmountLowThreshold = LOW_WATER;
-        ch.onbufferedamountlow = () => { drainResolve?.(); drainResolve = null; };
+        ch.onbufferedamountlow = () => { a.drainResolve?.(); a.drainResolve = null; };
         ch.onopen = () => { dbg?.(`send stripe ${k} dc open`); c.dc = ch; };
         ch.onclose = () => dbg?.(`send stripe ${k} dc closed`);
         ch.onerror = (e) => dbg?.(`send stripe ${k} dc error: ${e?.error ?? e}`);
         pc.onicecandidate = (e) => {
-            if (e.candidate) room.send({ sid, t: "ice", conn: k, candidate: candJson(e.candidate) });
+            if (e.candidate) room.send({ sid: a.sid, t: "ice", conn: k, candidate: candJson(e.candidate) });
         };
         (async () => {
             const offer = await pc.createOffer();
             await pc.setLocalDescription(offer);
-            room.send({ sid, t: "offer", conn: k, sdp: pc.localDescription.sdp, ice: turn });
+            room.send({ sid: a.sid, t: "offer", conn: k, sdp: pc.localDescription.sdp, ice: turn });
         })().catch(() => {}); // a stripe that never opens is not fatal
     };
 
-    room.onmessage = (msg) => {
-        if (msg.t === "hello" && !sid) {
-            sid = msg.sid;
-            // stripes need native engines on both ends; werift ends say 1
-            const maxConns = native ? Math.min(msg.conns ?? 1, STRIPE_CONNS) : 1;
-            status("receiver found, connecting…");
-            const pc = new RTCPeerConnection({ iceServers: [...STUN, ...turn] });
-            const c0 = { pc, dc: null, used: true };
-            conns[0] = c0;
-            watchConnection(pc, die);
-            dc = pc.createDataChannel("freedrop", { ordered: true });
-            dc.binaryType = "arraybuffer";
-            dc.bufferedAmountLowThreshold = LOW_WATER;
-            dc.onbufferedamountlow = () => { drainResolve?.(); drainResolve = null; };
-            let streaming = false;
-            dc.onmessage = (ev) => {
-                const { msg: m } = parseFrame(ev.data);
-                if (!m) return;
-                if (m.t === "accept") {
-                    if (streaming) return; // duplicate accept must not restart
-                    streaming = true;
-                    startStreaming().catch((e) => die(`\nsend failed: ${e.message}`));
-                }
-                else if (m.t === "done") {
-                    const secs = ((Date.now() - t0.v) / 1000).toFixed(1);
+    const beginAttempt = (sid, connsWanted) => {
+        // stripes need native engines on both ends; werift ends say 1
+        const maxConns = native ? Math.min(connsWanted ?? 1, STRIPE_CONNS) : 1;
+        const a = {
+            sid, conns: [], dead: false, streaming: false,
+            drainResolve: null, chunkSize: 16 * 1024 - 9,
+        };
+        at = a;
+        status("receiver found, connecting…");
+        const pc = new RTCPeerConnection({ iceServers: [...STUN, ...turn] });
+        const c0 = { pc, dc: null, used: true };
+        a.conns[0] = c0;
+        pc.onconnectionstatechange = () => {
+            dbg?.(`send conn 0 pc: ${pc.connectionState}`);
+            if (pc.connectionState === "failed" && !a.dead) {
+                teardown(a);
+                if (at === a) {
                     status("");
-                    console.log(`✓ sent ${fmtSize(total)} in ${secs}s`);
-                    setTimeout(() => cleanupAndExit(0), 300);
-                } else if (m.t === "reject") {
-                    die("\nreceiver declined the transfer");
+                    console.error(acceptedEver ? "receiver lost — waiting for a reconnect…  (Ctrl-C to stop)" : NAT_HINT);
+                    if (!acceptedEver) console.error("still waiting — a receiver retry may get through…");
                 }
-            };
-            dc.onopen = () => {
-                c0.dc = dc;
-                dc.send(jframe({ t: "manifest", files: files.map(({ name, size }) => ({ name, size })) }));
-            };
-            pc.onicecandidate = (e) => {
-                if (e.candidate) room.send({ sid, t: "ice", candidate: candJson(e.candidate) });
-            };
-            (async () => {
-                const offer = await pc.createOffer();
-                await pc.setLocalDescription(offer);
-                // TURN rides along so the receiving side gets a relay path too
-                room.send({ sid, t: "offer", sdp: pc.localDescription.sdp, ice: turn });
-            })().catch((e) => die(`webrtc: ${e.message}`));
-            if (total >= STRIPE_MIN) {
-                for (let k = 1; k < maxConns; k++) addStripe(k);
             }
-        } else if (msg.sid !== sid) {
-            // single-receiver semantics: whoever said hello first wins
+        };
+        const dc = pc.createDataChannel("freedrop", { ordered: true });
+        dc.binaryType = "arraybuffer";
+        dc.bufferedAmountLowThreshold = LOW_WATER;
+        dc.onbufferedamountlow = () => { a.drainResolve?.(); a.drainResolve = null; };
+        dc.onclose = () => {
+            dbg?.("send conn 0 dc closed");
+            if (!a.dead && !done) {
+                teardown(a);
+                if (at === a && acceptedEver) status("receiver lost — waiting for a reconnect…  (Ctrl-C to stop)");
+            }
+        };
+        dc.onmessage = (ev) => {
+            const { msg: m } = parseFrame(ev.data);
+            if (!m) return;
+            if (m.t === "accept") {
+                if (a.streaming) return; // duplicate accept must not restart
+                a.streaming = true;
+                acceptedEver = true;
+                streamAll(a, m.have).catch((e) => {
+                    if (e === ABORT) {
+                        if (at === a) status("receiver lost — waiting for a reconnect…  (Ctrl-C to stop)");
+                    } else die(`\nsend failed: ${e.message}`);
+                });
+            } else if (m.t === "more") {
+                streamMore(a, m.have).catch((e) => {
+                    if (e === ABORT) {
+                        if (at === a) status("receiver lost — waiting for a reconnect…  (Ctrl-C to stop)");
+                    } else die(`\nsend failed: ${e.message}`);
+                });
+            } else if (m.t === "done") {
+                done = true;
+                const secs = ((Date.now() - t0.v) / 1000).toFixed(1);
+                status("");
+                console.log(`✓ sent ${fmtSize(total)} in ${secs}s — verified by the receiver`);
+                teardown(a);
+                room.close();
+                setTimeout(() => process.exit(0), 300);
+            } else if (m.t === "reject") {
+                die("\nreceiver declined the transfer");
+            }
+        };
+        dc.onopen = () => {
+            c0.dc = dc;
+            dc.send(jframe({
+                t: "manifest",
+                files: files.map(({ name, size, mtime }) => ({ name, size, mtime })),
+            }));
+        };
+        pc.onicecandidate = (e) => {
+            if (e.candidate) room.send({ sid: a.sid, t: "ice", candidate: candJson(e.candidate) });
+        };
+        (async () => {
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+            // TURN rides along so the receiving side gets a relay path too
+            room.send({ sid: a.sid, t: "offer", sdp: pc.localDescription.sdp, ice: turn });
+        })().catch((e) => die(`webrtc: ${e.message}`));
+        if (total >= STRIPE_MIN) {
+            for (let k = 1; k < maxConns; k++) addStripe(a, k);
+        }
+    };
+
+    room.onmessage = (msg) => {
+        if (msg.t === "hello") {
+            // same sid again is the receiver's periodic re-hello — ignore
+            // unless that attempt is already dead. A new sid supersedes:
+            // whoever holds the code is the receiver, and a reconnecting
+            // receiver arrives with a fresh sid.
+            if (at && !at.dead && msg.sid === at.sid) return;
+            teardown(at);
+            beginAttempt(msg.sid, msg.conns);
+        } else if (!at || msg.sid !== at.sid) {
+            // stale attempt traffic
         } else if (msg.t === "answer") {
             const k = msg.conn ?? 0;
-            if (k === 0) chunkSize = chunkFor(msg.sdp);
-            conns[k]?.pc.setRemoteDescription({ type: "answer", sdp: msg.sdp }).catch(() => {});
+            if (k === 0) at.chunkSize = chunkFor(msg.sdp);
+            at.conns[k]?.pc.setRemoteDescription({ type: "answer", sdp: msg.sdp }).catch(() => {});
         } else if (msg.t === "ice") {
-            conns[msg.conn ?? 0]?.pc.addIceCandidate(msg.candidate).catch(() => {});
+            at.conns[msg.conn ?? 0]?.pc.addIceCandidate(msg.candidate).catch(() => {});
         }
     };
 }
 
 // ---- receive ----------------------------------------------------------------
+// Positional writes keyed by global offset land in <name>.part; coverage
+// lives in an interval set journaled to <name>.part.state (atomically,
+// twice a second). When a file is fully covered AND its hash frame has
+// arrived, the .part is re-read, verified, and renamed into place; the
+// journal disappears with it. Connection loss at any point tears down
+// the attempt and re-hellos — the same journal drives the accept {have}
+// of the next attempt, in this process or a later one.
 
 async function receive(code) {
     const key = b64u.decode(code);
@@ -459,27 +737,85 @@ async function receive(code) {
     const room = await SignalRoom.create({ key, role: "viewer", brokers: BROKERS })
         .catch((e) => die(`cannot reach any rendezvous broker: ${e.message}`));
 
-    const sid = randomBytes(8).toString("hex");
-    const pcs = []; // conn-index → { pc, ch, rx, last }
-    let dc = null; // control channel (connection 0)
+    // ---- transfer state (survives attempts) ----
     let manifest = null;
-    let files = null; // ledger: { i, size, base, path, fh, opening, written, closing }
-    let completed = 0;
-    let totalReceived = 0;
+    let files = null; // ledger: { i, name, size, mtime, base, path, resumed, fh, opening, ranges, covered, dirty, sha, finalizing, done }
     let total = 0;
+    let coveredTotal = 0;
+    let completed = 0;
     let t0 = 0;
+    let acceptedEver = false;
+    let finished = false;
+    let pendingWrites = 0;
+    let moreRounds = 0;
     const taken = new Set(); // paths reserved before their files exist
 
-    const offerTimer = setTimeout(
-        () => die("no sender found — is `freedrop <files>` still running on the other side?"),
-        20_000,
-    );
+    // ---- attempt state ----
+    let at = null; // { sid, pcs: [{ pc, ch, rx, last }], dc, gotOffer }
+    const startedAt = Date.now();
+    let connectedOnce = false;
+    let disconnectedAt = 0;
+    let lastData = Date.now();
 
-    // avoid clobbering: aaa.txt -> aaa(1).txt
+    const partPath = (f) => f.path + ".part";
+    const statePath = (f) => f.path + ".part.state";
+
+    const flushStates = () => {
+        for (const f of files ?? []) {
+            if (!f.dirty || f.done) continue;
+            f.dirty = false;
+            try { // atomic: a torn journal must parse as garbage, not lie
+                const tmp = statePath(f) + ".tmp";
+                writeFileSync(tmp, JSON.stringify({
+                    v: 2, name: f.name, size: f.size, mtime: f.mtime, ranges: f.ranges,
+                }));
+                renameSync(tmp, statePath(f));
+            } catch {}
+        }
+    };
+
+    const resumeHint = () =>
+        console.error(
+            `\n${fmtSize(coveredTotal)} of ${fmtSize(total)} is saved.\n` +
+            `resume by re-running:  freedrop ${code}`,
+        );
+
+    process.on("SIGINT", () => {
+        try { flushStates(); } catch {}
+        if (acceptedEver && !finished) resumeHint();
+        process.exit(130);
+    });
+
+    const giveUp = () => {
+        flushStates();
+        status("");
+        console.error("connection lost and could not be re-established.");
+        if (acceptedEver) resumeHint();
+        process.exit(1);
+    };
+
+    // journals left by an interrupted run, matched by name+size+mtime —
+    // a changed source file must not resume into stale bytes
+    const loadJournals = () => {
+        const found = [];
+        let names = [];
+        try { names = readdirSync(outDir); } catch {}
+        for (const n of names) {
+            if (!n.endsWith(".part.state")) continue;
+            try {
+                const st = JSON.parse(readFileSync(join(outDir, n), "utf8"));
+                const part = join(outDir, n.slice(0, -".state".length));
+                if (st.v === 2 && existsSync(part)) found.push({ ...st, part, claimed: false });
+            } catch {} // torn or foreign journal — ignore
+        }
+        return found;
+    };
+
+    // avoid clobbering: aaa.txt -> aaa(1).txt (also dodge foreign .part staging)
     const freshPath = (name) => {
         const safe = basename(name);
         let p = join(outDir, safe);
-        for (let n = 1; existsSync(p) || taken.has(p); n++) {
+        for (let n = 1; existsSync(p) || existsSync(p + ".part") || taken.has(p); n++) {
             const dot = safe.lastIndexOf(".");
             p = join(outDir, dot > 0 ? `${safe.slice(0, dot)}(${n})${safe.slice(dot)}` : `${safe}(${n})`);
         }
@@ -488,25 +824,29 @@ async function receive(code) {
     };
 
     // the manifest only ever arrives over the DataChannel, so any reply
-    // here is guaranteed an open channel
-    const sendCtl = (obj) => dc.send(jframe(obj));
+    // here is guaranteed an open channel (of the current attempt)
+    const sendCtl = (obj) => {
+        try { at.dc.send(jframe(obj)); } catch {}
+    };
 
-    const finish = () => {
+    const globalHave = () => {
+        const have = [];
+        for (const f of files) for (const [s, e] of f.ranges) have.push([f.base + s, f.base + e]);
+        return have;
+    };
+
+    const finishAll = () => {
+        finished = true;
         sendCtl({ t: "done" });
         const secs = ((Date.now() - t0) / 1000).toFixed(1);
         status("");
-        console.log(`✓ received ${fmtSize(totalReceived)} in ${secs}s`);
+        console.log(`✓ received ${fmtSize(total)} in ${secs}s — verified`);
         setTimeout(() => {
-            for (const c of pcs) { try { c?.pc.close(); } catch {} }
+            teardownAttempt();
             room.close();
             process.exit(0);
         }, 300);
     };
-
-    // ---- positional writes keyed by global offset --------------------------
-    // Chunks may arrive on any stripe in any relative order; each lands at
-    // its offset in a preallocated file. A file is done when every byte of
-    // it has been written — there are no per-file control frames.
 
     const fileAt = (offset) => {
         let lo = 0;
@@ -519,122 +859,287 @@ async function receive(code) {
         return files[lo];
     };
 
-    const maybeClose = (f) => {
-        if (f.written !== f.size || f.closing) return;
-        f.closing = true;
-        f.opening.then(() => f.fh.close()).then(() => {
-            if (++completed === files.length) finish();
-        }).catch((e) => die(`\n${basename(f.path)}: ${e.message}`));
+    // fully covered + hash arrived → verify the staged bytes, then rename.
+    // Verification is local re-read; a mismatch means the sender's file
+    // changed between runs (or corruption) — the stage is discarded so the
+    // next run starts clean instead of resuming into garbage forever.
+    const maybeFinalize = (f) => {
+        if (f.done || f.finalizing || !f.sha || f.covered !== f.size) return;
+        f.finalizing = true;
+        (async () => {
+            await f.opening;
+            await f.fh?.close();
+            const hasher = new BlockHasher();
+            if (f.size > 0) {
+                for await (const b of createReadStream(partPath(f))) hasher.update(b);
+            }
+            if (hasher.digest() !== f.sha) {
+                rmSync(partPath(f), { force: true });
+                rmSync(statePath(f), { force: true });
+                die(
+                    `\n${basename(f.path)}: verification failed — the sender's file changed, ` +
+                    "or data was corrupted.\npartial data discarded; re-run to transfer it fresh.",
+                );
+            }
+            renameSync(partPath(f), f.path);
+            rmSync(statePath(f), { force: true });
+            f.done = true;
+            if (++completed === files.length) finishAll();
+        })().catch((e) => die(`\n${basename(f.path)}: ${e.message}`));
     };
 
     const onChunk = (offset, chunk) => {
         const f = fileAt(offset);
         const local = offset - f.base;
         if (local + chunk.length > f.size) die("\ndata outside any file — aborting");
+        if (f.done || f.finalizing) return; // late duplicate after verification began
         if (!f.opening) {
-            f.opening = open(f.path, "w").then(async (fh) => {
+            // resumed stages reopen in place ("w" would truncate them)
+            f.opening = open(partPath(f), f.resumed ? "r+" : "w").then(async (fh) => {
                 f.fh = fh;
                 await fh.truncate(f.size);
             });
         }
+        pendingWrites++;
         f.opening.then(() => f.fh.write(chunk, 0, chunk.length, local)).then(() => {
-            f.written += chunk.length;
-            maybeClose(f);
+            pendingWrites--;
+            const added = addRange(f.ranges, local, local + chunk.length);
+            f.covered += added;
+            coveredTotal += added;
+            f.dirty = true;
+            maybeFinalize(f);
+            progressLine("receiving", coveredTotal, total, t0);
         }).catch((e) => die(`\n${basename(f.path)}: ${e.message}`));
-        totalReceived += chunk.length;
-        progressLine("receiving", totalReceived, total, t0);
+    };
+
+    const acceptNow = () => {
+        acceptedEver = true;
+        if (!t0) t0 = Date.now();
+        // empty files get no chunks — stage them right away
+        for (const f of files) {
+            if (f.size > 0 || f.opening) continue;
+            f.opening = open(partPath(f), "w").then((fh) => { f.fh = fh; });
+            maybeFinalize(f);
+        }
+        sendCtl({ t: "accept", have: globalHave() });
+    };
+
+    const onManifest = (m) => {
+        if (manifest) {
+            // a reconnect re-sends the manifest — it must be the same transfer
+            const same = m.files.length === manifest.length && m.files.every((mf, i) =>
+                mf.name === manifest[i].name && mf.size === manifest[i].size && mf.mtime === manifest[i].mtime);
+            if (!same) die("\nthe sender is now offering a different transfer — aborting");
+            if (acceptedEver) acceptNow(); // fresh attempt: re-accept with current coverage
+            return;
+        }
+        manifest = m.files;
+        total = manifest.reduce((n, f) => n + f.size, 0);
+        const journals = loadJournals();
+        let base = 0;
+        coveredTotal = 0;
+        files = manifest.map((mf, i) => {
+            const prior = journals.find((j) =>
+                !j.claimed && j.name === mf.name && j.size === mf.size && j.mtime === mf.mtime);
+            let path;
+            let ranges = [];
+            if (prior) {
+                prior.claimed = true;
+                path = prior.part.slice(0, -".part".length);
+                taken.add(path);
+                ranges = cleanRanges(prior.ranges, mf.size);
+            } else {
+                // a stale journal for this name (the source changed since
+                // that run) would block the clean filename forever —
+                // reclaim it, unless its stage was written in the last few
+                // seconds (then it belongs to a live sibling receiver)
+                for (const j of journals) {
+                    if (j.claimed || j.name !== mf.name) continue;
+                    try {
+                        if (statSync(j.part).mtimeMs > Date.now() - 10_000) continue;
+                        j.claimed = true;
+                        rmSync(j.part, { force: true });
+                        rmSync(j.part + ".state", { force: true });
+                    } catch {}
+                }
+                path = freshPath(mf.name);
+            }
+            const entry = {
+                i, name: mf.name, size: mf.size, mtime: mf.mtime, base, path,
+                resumed: !!prior, fh: null, opening: null, ranges,
+                covered: coveredBytes(ranges), dirty: false, sha: null,
+                finalizing: false, done: false,
+            };
+            coveredTotal += entry.covered;
+            base += mf.size;
+            return entry;
+        });
+        console.log(`incoming: ${manifest.length} file(s), ${fmtSize(total)}`);
+        for (const f of manifest) console.log(`  ${basename(f.name)}  (${fmtSize(f.size)})`);
+        if (coveredTotal > 0) {
+            console.log(`resuming — ${fmtSize(coveredTotal)} already on disk`);
+            return acceptNow(); // the user accepted this transfer once already
+        }
+        if (flags.yes) return acceptNow();
+        const rl = createInterface({ input: process.stdin, output: process.stderr });
+        rl.question(`save to ${outDir === "." ? "current directory" : outDir}? [Y/n] `, (a) => {
+            rl.close();
+            if (/^n/i.test(a.trim())) {
+                sendCtl({ t: "reject" });
+                process.exit(1);
+            }
+            acceptNow();
+        });
+    };
+
+    // after eof, wait for in-flight writes to settle, then either let
+    // verification finish the job or report the gaps for a fill round
+    const onEof = async () => {
+        while (pendingWrites > 0) await new Promise((r) => setTimeout(r, 50));
+        if (finished || coveredTotal === total) return;
+        if (++moreRounds > 5) die("\ntransfer cannot complete — data lost on every fill round");
+        dbg?.(`eof with gaps — requesting fill round ${moreRounds}`);
+        // gap chunks arrive at lower offsets than the stripes have seen;
+        // lift the per-channel replay guard for the new round
+        for (const c of at.pcs) if (c) c.last = -1;
+        sendCtl({ t: "more", have: globalHave() });
     };
 
     const onFrame = (c, ev) => {
         const { msg, chunk, offset } = parseFrame(ev.data);
+        lastData = Date.now();
+        disconnectedAt = 0;
         if (chunk) {
             if (offset <= c.last) return; // engine replayed a message
             c.last = offset;
             return onChunk(offset, chunk);
         }
-        if (msg.t === "manifest") {
-            if (manifest) return; // engines may replay events — accept once
-            manifest = msg.files;
-            total = manifest.reduce((n, f) => n + f.size, 0);
-            let base = 0;
-            files = manifest.map((f, i) => {
-                const entry = {
-                    i, size: f.size, base, path: freshPath(f.name),
-                    fh: null, opening: null, written: 0, closing: false,
-                };
-                base += f.size;
-                return entry;
-            });
-            console.log(`incoming: ${manifest.length} file(s), ${fmtSize(total)}`);
-            for (const f of manifest) console.log(`  ${basename(f.name)}  (${fmtSize(f.size)})`);
-            const go = () => {
-                t0 = Date.now();
-                sendCtl({ t: "accept" });
-                // empty files get no chunks — create them right away
-                for (const f of files) {
-                    if (f.size > 0) continue;
-                    f.opening = open(f.path, "w").then((fh) => { f.fh = fh; });
-                    maybeClose(f);
-                }
-            };
-            if (flags.yes) return go();
-            const rl = createInterface({ input: process.stdin, output: process.stderr });
-            rl.question(`save to ${outDir === "." ? "current directory" : outDir}? [Y/n] `, (a) => {
-                rl.close();
-                if (/^n/i.test(a.trim())) {
-                    sendCtl({ t: "reject" });
-                    process.exit(1);
-                }
-                go();
-            });
+        if (msg.t === "manifest") onManifest(msg);
+        else if (msg.t === "hash") {
+            const f = files?.[msg.i];
+            if (f && !f.done && typeof msg.sha === "string") {
+                f.sha = msg.sha;
+                maybeFinalize(f);
+            }
+        } else if (msg.t === "eof") onEof();
+    };
+
+    const teardownAttempt = () => {
+        if (!at) return;
+        for (const c of at.pcs) { try { c?.pc.close(); } catch {} }
+        at = null;
+    };
+
+    const startAttempt = () => {
+        teardownAttempt();
+        at = {
+            sid: randomBytes(8).toString("hex"),
+            pcs: [], dc: null, gotOffer: false,
+        };
+        room.send({ sid: at.sid, t: "hello", conns: native ? STRIPE_CONNS : 1 });
+    };
+
+    const retry = (why) => {
+        if (finished) return;
+        dbg?.(`retry: ${why}`);
+        if (!acceptedEver) {
+            // never carried data — almost always NAT, and retrying the
+            // same pair of networks will not do better
+            if (connectedOnce) die(NAT_HINT);
+            return; // pre-connection: the hello re-send loop is still trying
         }
+        const now = Date.now();
+        if (!disconnectedAt) disconnectedAt = now;
+        if (now - disconnectedAt > RETRY_WINDOW) return giveUp();
+        flushStates();
+        status("connection lost — reconnecting…");
+        lastData = now; // fresh grace period for the new attempt
+        startAttempt();
     };
 
     room.onmessage = async (msg) => {
-        if (msg.sid !== sid) return;
+        if (!at || msg.sid !== at.sid) return;
         if (msg.t === "offer") {
             const k = msg.conn ?? 0;
-            if (pcs[k]) return; // replayed offer
+            if (at.pcs[k]) return; // replayed offer
+            const a = at;
+            a.gotOffer = true;
             if (k === 0) {
-                clearTimeout(offerTimer);
-                status("sender found, connecting…");
+                connectedOnce = true;
+                status(manifest ? "reconnected…" : "sender found, connecting…");
             }
             const pc = new RTCPeerConnection({ iceServers: [...STUN, ...(msg.ice ?? []), ...turnExtra] });
             const c = { pc, ch: null, rx: false, last: -1 };
-            pcs[k] = c;
-            if (k === 0) watchConnection(pc, die);
-            else pc.onconnectionstatechange = () => {
-                dbg?.(`recv stripe ${k} pc: ${pc.connectionState}`);
-                // a stripe that already delivered data dying means lost bytes
-                if (pc.connectionState === "failed" && c.rx) die("\nstripe connection lost mid-transfer");
+            a.pcs[k] = c;
+            pc.onconnectionstatechange = () => {
+                dbg?.(`recv conn ${k} pc: ${pc.connectionState}`);
+                if (at !== a || pc.connectionState !== "failed") return;
+                if (k === 0 || c.rx) retry(`conn ${k} failed`);
             };
             pc.ondatachannel = (e) => {
                 if (c.ch) return;
                 dbg?.(`recv conn ${k} dc arrived`);
                 c.ch = e.channel;
                 c.ch.binaryType = "arraybuffer";
-                c.ch.onclose = () => dbg?.(`recv conn ${k} dc closed`);
+                c.ch.onclose = () => {
+                    dbg?.(`recv conn ${k} dc closed`);
+                    if (at === a && k === 0) retry("control channel closed");
+                };
                 c.ch.onmessage = (ev) => {
                     c.rx = true;
                     onFrame(c, ev);
                 };
-                if (k === 0) dc = c.ch;
+                if (k === 0) at.dc = c.ch;
             };
             pc.onicecandidate = (e) => {
-                if (e.candidate) room.send({ sid, t: "ice", conn: k, candidate: candJson(e.candidate) });
+                if (e.candidate) room.send({ sid: a.sid, t: "ice", conn: k, candidate: candJson(e.candidate) });
             };
             (async () => {
                 await pc.setRemoteDescription({ type: "offer", sdp: msg.sdp });
                 const answer = await pc.createAnswer();
                 await pc.setLocalDescription(answer);
-                room.send({ sid, t: "answer", conn: k, sdp: pc.localDescription.sdp });
+                room.send({ sid: a.sid, t: "answer", conn: k, sdp: pc.localDescription.sdp });
             })().catch((e) => die(`webrtc: ${e.message}`));
         } else if (msg.t === "ice") {
-            pcs[msg.conn ?? 0]?.pc.addIceCandidate(msg.candidate).catch(() => {});
+            at.pcs[msg.conn ?? 0]?.pc.addIceCandidate(msg.candidate).catch(() => {});
         }
     };
 
-    room.send({ sid, t: "hello", conns: native ? STRIPE_CONNS : 1 });
+    // journal flush — small, atomic, twice a second while data flows
+    const flushTimer = setInterval(flushStates, 500);
+    flushTimer.unref?.();
+
+    // hello re-send until an offer lands: covers a sender that starts (or
+    // restarts) after us, and a first hello lost in broker weather
+    const helloTimer = setInterval(() => {
+        if (at && !at.gotOffer && !finished) {
+            room.send({ sid: at.sid, t: "hello", conns: native ? STRIPE_CONNS : 1 });
+        }
+    }, 5000);
+    helloTimer.unref?.();
+
+    // liveness: data stalls mean a dead peer far more often than a slow
+    // one — tear down and re-negotiate; the journal makes it cheap. Once
+    // everything is covered and every hash is in, the rest is local work
+    // and no timer should touch it.
+    const healthTimer = setInterval(() => {
+        if (finished || !at) return;
+        const now = Date.now();
+        if (!connectedOnce) {
+            if (now - startedAt > 20_000) {
+                die("no sender found — is `freedrop <files>` still running on the other side?");
+            }
+            return;
+        }
+        if (!acceptedEver) return; // waiting at the prompt is not a stall
+        const allShaKnown = files.every((f) => f.done || f.sha);
+        if (coveredTotal === total && allShaKnown) return; // verifying locally
+        const grace = coveredTotal === total ? 30_000 : 20_000;
+        if (now - lastData > grace) retry("no data");
+    }, 3000);
+    healthTimer.unref?.();
+
+    startAttempt();
 }
 
 // ---- dispatch ---------------------------------------------------------------

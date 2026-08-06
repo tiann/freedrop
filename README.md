@@ -69,6 +69,7 @@ traffic bill, and why nobody's server ever holds your data.
 |---|---|---|
 | `-y`, `--yes` | receive | skip the confirmation prompt |
 | `-o`, `--out <dir>` | receive | save files here (default: current dir) |
+| `--code <code>` | send | reuse a transfer code (resume an interrupted send) |
 | `--turn <target>` | both | `cloudflare` or a `turn:`/`turns:` URL |
 | `--turn-auth <u:p>` | both | credentials for a `--turn` URL |
 | `--broker <list>` | both | custom comma-separated `wss://` MQTT brokers |
@@ -89,9 +90,30 @@ Node 22+ (uses the built-in WebSocket).
 What the incumbents still do better (v1 honesty): croc and wormhole have a
 relay, so they succeed on double-symmetric NAT without any setup; their
 short PAKE codes can be read over the phone (freedrop's code is long —
-copy, link, or QR); croc resumes interrupted transfers and sends
-directories. On the roadmap: PAKE short codes, directory support, resume,
-mDNS local discovery for offline LANs.
+copy, link, or QR); croc sends directories. On the roadmap: PAKE short
+codes, directory support, mDNS local discovery for offline LANs.
+
+## Resume & integrity
+
+Interrupted transfers pick up where they stopped. The receiver stages
+each file as `<name>.part` next to a tiny journal of the byte ranges
+already on disk; on any reconnection only the missing ranges travel.
+That covers every way a transfer dies:
+
+- **Network blip** — both ends stay running, re-negotiate through the
+  rendezvous room, and continue automatically (the receiver retries for
+  ~90 s before giving up; the journal survives either way).
+- **Receiver died** — re-run the same `freedrop <code>` (or reopen the
+  same browser link: the staging area in the browser survives the tab).
+- **Sender died** — re-run it as `freedrop --code <code> <files>`; the
+  waiting receiver reconnects by itself.
+
+Every file is verified end to end before it lands: the sender hashes
+while reading (SHA-256 over 4 MiB blocks), the receiver re-reads the
+staged bytes and compares before renaming `<name>.part` into place — so
+a resumed transfer whose source file changed in between fails loudly
+instead of producing a silently corrupt file. (A changed modification
+time already discards stale partials up front.)
 
 ## Limitations
 
@@ -100,6 +122,8 @@ mDNS local discovery for offline LANs.
 - Directories: `tar` them for now.
 - An offline LAN can't rendezvous (the brokers are on the internet), even
   though the transfer itself would stay local.
+- A browser *sender* can't resume across a page reload (the picked files
+  don't survive it) — browser receivers and both CLI roles all resume.
 
 ## Speed
 
