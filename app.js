@@ -36,7 +36,8 @@ const T = zh ? {
     noSender: "找不到发送方 — 确认对方的 freedrop 还开着",
     p2pFail: "P2P 连接失败（双方都在对称 NAT/CGNAT 后面）— 发送方加 --turn 可解决",
     declined: "对方拒绝了",
-    memWarn: "此浏览器不支持流式保存，大文件会占用内存",
+    tooOld: "此浏览器太旧（不支持 OPFS 本地暂存）",
+    noSpace: (s) => `浏览器存储空间不足（需要 ${s}）`,
     noRtc: "此浏览器不支持 WebRTC",
     brokerFail: "连不上任何会合节点 — 检查网络",
 } : {
@@ -55,7 +56,8 @@ const T = zh ? {
     noSender: "no sender found — is their freedrop still running?",
     p2pFail: "P2P failed (symmetric NAT/CGNAT on both ends) — the sender can fix it with --turn",
     declined: "the other side declined",
-    memWarn: "this browser can't stream to disk; large files are held in memory",
+    tooOld: "this browser is too old (no OPFS staging support)",
+    noSpace: (s) => `not enough browser storage (need ${s})`,
     noRtc: "this browser does not support WebRTC",
     brokerFail: "cannot reach any rendezvous broker — check the network",
 };
@@ -122,6 +124,53 @@ function watchConnection(pc) {
         if (pc.connectionState === "failed") fatal(T.p2pFail);
     };
 }
+
+// The receiver's OPFS staging worker (see the receive section). Declared
+// before the dispatch below so receive() can reference it synchronously.
+const WORKER_SRC = `
+const files = new Map(); // id -> { size, written, ready, handle, access, done }
+const root = (async () => {
+    const opfs = await navigator.storage.getDirectory();
+    try { await opfs.removeEntry("freedrop", { recursive: true }); } catch {}
+    return opfs.getDirectoryHandle("freedrop", { create: true });
+})();
+const finish = async (id, f) => {
+    f.done = true;
+    f.access.flush();
+    f.access.close();
+    postMessage({ op: "file", id, file: await f.handle.getFile() });
+};
+onmessage = async (e) => {
+    const m = e.data;
+    try {
+        if (m.op === "probe") {
+            const dir = await root;
+            const h = await dir.getFileHandle("probe", { create: true });
+            (await h.createSyncAccessHandle()).close();
+            await dir.removeEntry("probe");
+            postMessage({ op: "ready" });
+        } else if (m.op === "open") {
+            const f = { size: m.size, written: 0, done: false };
+            files.set(m.id, f);
+            f.ready = (async () => {
+                f.handle = await (await root).getFileHandle("f" + m.id, { create: true });
+                f.access = await f.handle.createSyncAccessHandle();
+                f.access.truncate(m.size);
+                if (m.size === 0) await finish(m.id, f);
+            })();
+            await f.ready;
+        } else if (m.op === "write") {
+            const f = files.get(m.id);
+            await f.ready;
+            f.access.write(new Uint8Array(m.buf, m.off, m.len), { at: m.pos });
+            f.written += m.len;
+            if (!f.done && f.written >= f.size) await finish(m.id, f);
+        }
+    } catch (err) {
+        postMessage({ op: "error", message: String((err && err.message) || err) });
+    }
+};
+`;
 
 // ---------------------------------------------------------------------------
 
@@ -337,9 +386,24 @@ function sendMode() {
 }
 
 // ---- receive ----------------------------------------------------------------
+// MEGA-style client-side staging: chunks land in OPFS (origin-private,
+// zero permission prompts — the only per-file write API that works on
+// mobile, where showDirectoryPicker doesn't exist), then each finished
+// file becomes a normal browser download backed by the staged file on
+// disk, so nothing is ever held in memory. Writes run in a worker on a
+// SyncAccessHandle — the fastest browser write path (no per-chunk IPC).
+// Leftover staging from a torn-down session is swept on the next visit.
 
 async function receive(codeStr) {
     status(T.connecting);
+    if (!navigator.storage?.getDirectory) throw new Error(T.tooOld);
+    const worker = new Worker(URL.createObjectURL(new Blob([WORKER_SRC], { type: "text/javascript" })));
+    await new Promise((resolve, reject) => {
+        worker.onmessage = (e) => (e.data.op === "ready" ? resolve() : reject(new Error(T.tooOld)));
+        worker.onerror = () => reject(new Error(T.tooOld));
+        worker.postMessage({ op: "probe" });
+    });
+
     const key = b64u.decode(codeStr);
     const room = await SignalRoom.create({ key, role: "viewer" })
         .catch(() => { throw new Error(T.brokerFail); });
@@ -352,9 +416,7 @@ async function receive(codeStr) {
     let total = 0;
     let received = 0;
     let t0 = 0;
-    let dirHandle = null; // File System Access API when available, memory otherwise
-    // ledger: { i, name, size, base, writable, buf, opening, written, closing }
-    let vfiles = null;
+    let vfiles = null; // ledger: { i, name, size, base, opened }
     let completed = 0;
 
     const offerTimer = setTimeout(() => fatal(T.noSender), 20_000);
@@ -370,8 +432,9 @@ async function receive(codeStr) {
 
     // ---- positional writes keyed by global offset --------------------------
     // Chunks may arrive on any stripe in any relative order; each lands at
-    // its position in a preallocated sink. A file is done when every byte
-    // has been written — there are no per-file control frames.
+    // its position in a preallocated OPFS staging file. A file is done when
+    // every byte has been written — there are no per-file control frames.
+    // The worker owns all byte accounting and posts each finished File back.
 
     const fileAt = (offset) => {
         let lo = 0;
@@ -384,16 +447,6 @@ async function receive(codeStr) {
         return vfiles[lo];
     };
 
-    const openSink = async (f) => {
-        if (dirHandle) {
-            const fh = await dirHandle.getFileHandle(f.name.split("/").pop(), { create: true });
-            f.writable = await fh.createWritable();
-            await f.writable.truncate(f.size); // preallocate for positional writes
-        } else {
-            f.buf = new Uint8Array(f.size);
-        }
-    };
-
     const finish = () => {
         dc.send(jframe({ t: "done" }));
         bar(1);
@@ -404,42 +457,52 @@ async function receive(codeStr) {
         }, 500);
     };
 
-    const maybeClose = (f) => {
-        if (f.written !== f.size || f.closing) return;
-        f.closing = true;
-        f.opening.then(async () => {
-            if (f.writable) {
-                await f.writable.close();
-            } else if (f.buf) {
-                const a = document.createElement("a");
-                a.href = URL.createObjectURL(new Blob([f.buf]));
-                a.download = f.name.split("/").pop();
-                a.click();
-                setTimeout(() => URL.revokeObjectURL(a.href), 30_000);
-                f.buf = null;
-            }
-            if (++completed === vfiles.length) finish();
-        }).catch((e) => fatal(String(e.message ?? e)));
+    // a finished file becomes a download (disk-backed — no memory copy)
+    // and its list row becomes a link, for when the browser blocks the
+    // automatic click (multi-file transfers, mobile quirks)
+    const onFileReady = (i, file) => {
+        const f = vfiles[i];
+        const name = f.name.split("/").pop();
+        const url = URL.createObjectURL(file);
+        const row = $("files").children[i];
+        if (row) {
+            const a = document.createElement("a");
+            a.href = url;
+            a.download = name;
+            a.textContent = name;
+            row.firstElementChild.replaceChildren(a);
+        }
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = name;
+        a.click();
+        if (++completed === vfiles.length) finish();
     };
+
+    worker.onmessage = (e) => {
+        const m = e.data;
+        if (m.op === "file") onFileReady(m.id, m.file);
+        else if (m.op === "error") fatal(m.message);
+    };
+    worker.onerror = (e) => fatal(String(e.message ?? e));
 
     const onChunk = (offset, chunk) => {
         const f = fileAt(offset);
         const local = offset - f.base;
         if (local + chunk.length > f.size) return fatal("data outside any file");
-        // copy (the DataChannel buffer gets reused under us), then queue
-        // behind the sink open; positional writes need no ordering
-        const copy = chunk.slice();
-        if (!f.opening) f.opening = openSink(f);
-        f.opening
-            .then(() => (f.writable
-                ? f.writable.write({ type: "write", position: local, data: copy })
-                : f.buf.set(copy, local)))
-            .then(() => {
-                f.written += copy.length;
-                maybeClose(f);
-            })
-            .catch((e) => fatal(String(e.message ?? e)));
-        received += chunk.length;
+        if (!f.opened) {
+            f.opened = true;
+            worker.postMessage({ op: "open", id: f.i, size: f.size });
+        }
+        // the message buffer is transferred, not copied — datachannel to
+        // disk with zero copies on this thread (it detaches, so read the
+        // length first)
+        const len = chunk.length;
+        worker.postMessage(
+            { op: "write", id: f.i, pos: local, buf: chunk.buffer, off: chunk.byteOffset, len },
+            [chunk.buffer],
+        );
+        received += len;
         draw();
     };
 
@@ -456,10 +519,7 @@ async function receive(codeStr) {
             total = manifest.reduce((n, f) => n + f.size, 0);
             let base = 0;
             vfiles = manifest.map((f, i) => {
-                const entry = {
-                    i, name: f.name, size: f.size, base,
-                    writable: null, buf: null, opening: null, written: 0, closing: false,
-                };
+                const entry = { i, name: f.name, size: f.size, base, opened: false };
                 base += f.size;
                 return entry;
             });
@@ -470,24 +530,17 @@ async function receive(codeStr) {
             btn.textContent = T.save;
             btn.onclick = async () => {
                 btn.disabled = true;
-                // the picker must run inside the click gesture
-                if (window.showDirectoryPicker) {
-                    try {
-                        dirHandle = await window.showDirectoryPicker({ mode: "readwrite" });
-                    } catch {
-                        btn.disabled = false;
-                        return; // user cancelled the picker
-                    }
-                } else {
-                    status(T.memWarn);
-                }
+                try { // staging needs quota headroom for the whole transfer
+                    const { quota = Infinity, usage = 0 } = await navigator.storage.estimate();
+                    if (total > quota - usage) return fatal(T.noSpace(fmtSize(total)));
+                } catch {}
                 t0 = Date.now();
                 dc.send(jframe({ t: "accept" }));
                 // empty files get no chunks — create them right away
                 for (const f of vfiles) {
                     if (f.size > 0) continue;
-                    f.opening = openSink(f);
-                    maybeClose(f);
+                    f.opened = true;
+                    worker.postMessage({ op: "open", id: f.i, size: 0 });
                 }
             };
             $("actions").appendChild(btn);
