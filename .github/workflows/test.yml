@@ -1,0 +1,53 @@
+name: test
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Both jobs run hermetically: signaling goes through a local mosquitto
+# (ws:// MQTT) instead of the public brokers, and the data path is
+# WebRTC over loopback — no external network in the loop.
+
+jobs:
+  cli:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: start a local MQTT broker
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mosquitto
+          sudo systemctl stop mosquitto || true
+          printf 'listener 9001 127.0.0.1\nprotocol websockets\nallow_anonymous true\n' > /tmp/mosquitto.conf
+          mosquitto -c /tmp/mosquitto.conf -d
+      - run: npm ci
+      - run: npm test
+        env:
+          FREEDROP_TEST_BROKER: ws://127.0.0.1:9001
+
+  browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: start a local MQTT broker
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mosquitto
+          sudo systemctl stop mosquitto || true
+          printf 'listener 9001 127.0.0.1\nprotocol websockets\nallow_anonymous true\n' > /tmp/mosquitto.conf
+          mosquitto -c /tmp/mosquitto.conf -d
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:browser
+        env:
+          FREEDROP_TEST_BROKER: ws://127.0.0.1:9001
