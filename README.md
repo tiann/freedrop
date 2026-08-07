@@ -96,9 +96,11 @@ codes, directory support, mDNS local discovery for offline LANs.
 ## Resume & integrity
 
 Interrupted transfers pick up where they stopped. The receiver stages
-each file as `<name>.part` next to a tiny journal of the byte ranges
-already on disk; on any reconnection only the missing ranges travel.
-That covers every way a transfer dies:
+incoming bytes in a hidden `.freedrop-stage/` directory next to a tiny
+journal of the byte ranges already on disk; on any reconnection only
+the missing ranges travel. Files appear under their final names only
+after verification, and the staging directory disappears when the
+transfer completes. That covers every way a transfer dies:
 
 - **Network blip** — both ends stay running, re-negotiate through the
   rendezvous room, and continue automatically (the receiver retries for
@@ -142,6 +144,17 @@ use their own native stacks. The two ends negotiate frame size per
 connection, and every data frame carries its offset, so a misbehaving
 stack can be caught (duplicates dropped, gaps fatal) instead of
 corrupting the file.
+
+## Tests
+
+`npm test` runs the CLI↔CLI end-to-end suite: real WebRTC over
+loopback, SIGKILL-driven resume scenarios, sha256 over every byte.
+`npm run test:browser` adds the browser paths (all three interop
+directions, reload-resume, resume under a browser sender) via Playwright
+— run `npx playwright install chromium` once first. Signaling uses the
+public brokers by default; point `FREEDROP_TEST_BROKER` at a local
+`ws://` MQTT broker for a hermetic run — CI does exactly that with
+mosquitto (see `.github/workflows/test.yml`).
 
 ## Built on
 

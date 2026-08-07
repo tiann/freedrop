@@ -47,6 +47,7 @@ const T = zh ? {
     p2pFail: "P2P 连接失败（双方都在对称 NAT/CGNAT 后面）— 发送方加 --turn 可解决",
     savedReload: "连接中断 — 进度已保存，重新打开此链接可续传",
     declined: "对方拒绝了",
+    busyTab: "这个链接正在另一个标签页接收 — 关掉那边或用那边",
     badhash: (n) => `${n}: 校验失败 — 发送方的文件变了？请重新传输`,
     tooOld: "此浏览器太旧（不支持 OPFS 本地暂存）",
     noSpace: (s) => `浏览器存储空间不足（需要 ${s}）`,
@@ -72,6 +73,7 @@ const T = zh ? {
     p2pFail: "P2P failed (symmetric NAT/CGNAT on both ends) — the sender can fix it with --turn",
     savedReload: "connection lost — progress is saved; reopen this link to resume",
     declined: "the other side declined",
+    busyTab: "this link is already being received in another tab — use that one",
     badhash: (n) => `${n}: verification failed — did the sender's file change? transfer it again`,
     tooOld: "this browser is too old (no OPFS staging support)",
     noSpace: (s) => `not enough browser storage (need ${s})`,
@@ -192,7 +194,7 @@ const ABORT = Symbol("attempt aborted");
 const WORKER_SRC = `
 const BLOCK = ${HASH_BLOCK};
 const enc = new TextEncoder();
-const files = new Map(); // id -> { name, size, mtime, ranges, covered, dirty, sha, ready, handle, access, jhandle, finalizing, done }
+const files = new Map(); // id -> { name, size, mtime, ranges, covered, dirty, sha, ready, handle, access, slots, seq, finalizing, done }
 let dir = null;
 const hex = (buf) => [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
 const addRange = (rs, s, e) => {
@@ -216,45 +218,126 @@ const cleanRanges = (raw, max) => {
     return rs;
 };
 
+// Journals are double-slotted (fN.json / fN.json.b, monotone seq): OPFS
+// has no rename, so an in-place rewrite torn by a dying tab could parse
+// as garbage — and a lost journal costs the whole stage. Alternating
+// slots keeps one intact record at all times; a torn write loses at
+// most half a second of ranges.
+const savedSeq = new Map(); // id -> seq of the journal chosen at init
+const writeJournal = (f, obj) => { // throws: callers decide what a failure means
+    // The sequence is a commit index, not an attempt counter. If write,
+    // truncate, or flush fails, retry the same inactive slot so the last
+    // known-good slot is never touched until its replacement is durable.
+    const seq = f.seq + 1;
+    const buf = enc.encode(JSON.stringify({ ...obj, seq }));
+    const slot = f.slots[seq % 2];
+    slot.write(buf, { at: 0 });
+    slot.truncate(buf.length);
+    slot.flush();
+    f.seq = seq;
+};
+
+// transfer-level liveness/completion marker: "meta" carries a heartbeat
+// while this page owns the stage and done:true once the transfer lands.
+// The sweep below trusts ONLY this file — journals can't express
+// "paused but worth keeping" (small files leave done slots, unstarted
+// ones leave empty journals).
+let metaAccess = null;
+let metaDone = false;
+const writeMeta = () => {
+    if (!metaAccess) return;
+    try {
+        const buf = enc.encode(JSON.stringify({ v: 1, done: metaDone, t: Date.now() }));
+        metaAccess.write(buf, { at: 0 });
+        metaAccess.truncate(buf.length);
+        metaAccess.flush();
+    } catch {}
+};
+setInterval(() => { if (!metaDone) writeMeta(); }, 15_000);
+
+// a foreign stage may be swept only when it is finished or abandoned;
+// a live tab (fresh heartbeat, or meta locked by its open handle) and a
+// paused-within-a-week transfer both stay
+const KEEP_MS = 7 * 24 * 3600 * 1000;
+async function sweepable(d) {
+    let mf;
+    try {
+        mf = await (await d.getFileHandle("meta")).getFile();
+    } catch (e) {
+        // no meta at all: not a stage worth keeping. Anything else
+        // (locked by a live tab) — deletion is the dangerous direction.
+        return !!e && e.name === "NotFoundError";
+    }
+    try {
+        const m = JSON.parse(await mf.text());
+        if (m && m.done) return true;
+    } catch {} // torn meta must still expire — fall through to the age policy
+    return Date.now() - mf.lastModified > KEEP_MS;
+}
+
+async function readJournal(name) {
+    try {
+        const j = JSON.parse(await (await (await dir.getFileHandle(name)).getFile()).text());
+        return j && Number.isInteger(j.size) && Number.isInteger(j.seq) ? j : null;
+    } catch { return null; }
+}
+
 async function init(rid) {
     const opfs = await navigator.storage.getDirectory();
     const top = await opfs.getDirectoryHandle("freedrop", { create: true });
     const names = [];
     for await (const n of top.keys()) names.push(n);
-    for (const n of names) if (n !== rid) { try { await top.removeEntry(n, { recursive: true }); } catch {} }
+    for (const n of names) {
+        if (n === rid) continue;
+        let sweep = false;
+        try { sweep = await sweepable(await top.getDirectoryHandle(n)); } catch {}
+        if (sweep) { try { await top.removeEntry(n, { recursive: true }); } catch {} }
+    }
     dir = await top.getDirectoryHandle(rid, { create: true });
-    // probe the sync write path (private windows, old engines)
-    const ph = await dir.getFileHandle("probe", { create: true });
-    (await ph.createSyncAccessHandle()).close();
-    await dir.removeEntry("probe");
+    // claim this stage: the open meta handle doubles as a liveness lock
+    metaAccess = await (await dir.getFileHandle("meta", { create: true })).createSyncAccessHandle();
+    writeMeta();
     // journals from an interrupted visit of this same link
     const entries = [];
-    const dn = [];
-    for await (const n of dir.keys()) dn.push(n);
-    for (const n of dn) {
-        const m = /^f(\\d+)\\.json$/.exec(n);
-        if (!m) continue;
+    const ids = new Set();
+    for await (const n of dir.keys()) {
+        const m = /^f(\\d+)\\.json(\\.b)?$/.exec(n);
+        if (m) ids.add(Number(m[1]));
+    }
+    for (const i of ids) {
         try {
-            const j = JSON.parse(await (await (await dir.getFileHandle(n)).getFile()).text());
-            await dir.getFileHandle("f" + m[1]); // its stage must exist too
-            if (j && Number.isInteger(j.size)) {
-                entries.push({ i: Number(m[1]), name: j.name, size: j.size, mtime: j.mtime, ranges: j.ranges });
-            }
-        } catch {}
+            await dir.getFileHandle("f" + i);
+        } catch {
+            // journals without a stage are orphans (badhash cleanup torn
+            // mid-way) — their stale high seq would shadow a fresh run's
+            // journal later; remove them instead of skipping
+            try { await dir.removeEntry("f" + i + ".json"); } catch {}
+            try { await dir.removeEntry("f" + i + ".json.b"); } catch {}
+            continue;
+        }
+        const a = await readJournal("f" + i + ".json");
+        const b = await readJournal("f" + i + ".json.b");
+        const j = a && b ? (a.seq >= b.seq ? a : b) : (a ?? b);
+        if (!j) continue;
+        savedSeq.set(i, j.seq);
+        entries.push({ i, name: j.name, size: j.size, mtime: j.mtime, ranges: j.ranges, done: !!j.done });
     }
     postMessage({ op: "state", entries });
 }
 
 function flushJournals() {
     for (const f of files.values()) {
-        if (!f.dirty || f.done || !f.jhandle) continue;
-        f.dirty = false;
+        if (!f.dirty || f.done || !f.slots) continue;
         try {
-            const buf = enc.encode(JSON.stringify({ name: f.name, size: f.size, mtime: f.mtime, ranges: f.ranges }));
-            f.jhandle.write(buf, { at: 0 });
-            f.jhandle.truncate(buf.length);
-            f.jhandle.flush();
-        } catch {}
+            f.access.flush(); // the bytes a journal describes must be durable first
+            writeJournal(f, { name: f.name, size: f.size, mtime: f.mtime, ranges: f.ranges });
+            f.dirty = false; // cleared only after the journal landed — else retry
+            f.jfails = 0;
+        } catch (err) {
+            if (++f.jfails >= 10) { // persistently failing journal = broken resume
+                postMessage({ op: "error", message: String((err && err.message) || err) });
+            }
+        }
     }
 }
 setInterval(flushJournals, 500);
@@ -263,26 +346,36 @@ async function checkDone(id, f) {
     if (f.done || f.finalizing || !f.sha || f.covered !== f.size) return;
     f.finalizing = true;
     f.access.flush();
+    // the delivered artifact must be byte-for-byte what we hash: exact
+    // length and every read complete — a sealed stage with appended
+    // bytes would otherwise hash clean on its prefix and ship the extra
+    let ok = f.access.getSize() === f.size;
     const digests = [];
-    for (let pos = 0; pos < f.size; pos += BLOCK) {
+    for (let pos = 0; ok && pos < f.size; pos += BLOCK) {
         const buf = new Uint8Array(Math.min(BLOCK, f.size - pos));
-        f.access.read(buf, { at: pos });
+        if (f.access.read(buf, { at: pos }) !== buf.length) { ok = false; break; }
         digests.push(new Uint8Array(await crypto.subtle.digest("SHA-256", buf)));
     }
     const cat = new Uint8Array(digests.length * 32);
     digests.forEach((d, k) => cat.set(d, k * 32));
-    const sha = hex(await crypto.subtle.digest("SHA-256", cat));
+    const sha = ok ? hex(await crypto.subtle.digest("SHA-256", cat)) : null;
     f.access.close();
-    f.jhandle.close();
-    if (sha !== f.sha) { // sender's file changed between runs, or corruption
+    if (sha !== f.sha) { // wrong length, changed source, or corruption
+        for (const s of f.slots ?? []) { try { s.close(); } catch {} }
         try { await dir.removeEntry("f" + id); } catch {}
         try { await dir.removeEntry("f" + id + ".json"); } catch {}
+        try { await dir.removeEntry("f" + id + ".json.b"); } catch {}
         files.delete(id);
         postMessage({ op: "badhash", id, name: f.name });
         return;
     }
-    try { await dir.removeEntry("f" + id + ".json"); } catch {}
     f.done = true;
+    if (f.slots) { // sealed re-checks already carry their marker on disk
+        // keep a done marker: a reloaded page must not re-download this
+        // file (a failed marker write only costs a re-download)
+        try { writeJournal(f, { name: f.name, size: f.size, mtime: f.mtime, done: true }); } catch {}
+        for (const s of f.slots) { try { s.close(); } catch {} }
+    }
     postMessage({ op: "file", id, file: await f.handle.getFile() });
 }
 
@@ -292,10 +385,30 @@ onmessage = async (e) => {
         if (m.op === "init") await init(m.rid);
         else if (m.op === "open") {
             if (files.has(m.id)) return; // a reconnect re-opens — idempotent
+            if (m.done) {
+                // verified by an earlier visit — but it must still prove
+                // itself against THIS run's hash (the source may have been
+                // swapped, same name/size/mtime): hold the stage sealed
+                // until the hash frame arrives, then re-verify it
+                const f = {
+                    name: m.name, size: m.size, mtime: m.mtime,
+                    ranges: [[0, m.size]], covered: m.size, dirty: false,
+                    sha: null, seq: savedSeq.get(m.id) ?? 0, slots: null,
+                    sealed: true, finalizing: false, done: false, jfails: 0,
+                };
+                files.set(m.id, f);
+                f.ready = (async () => {
+                    f.handle = await dir.getFileHandle("f" + m.id);
+                    f.access = await f.handle.createSyncAccessHandle();
+                })();
+                await f.ready;
+                return;
+            }
             const ranges = cleanRanges(m.ranges, m.size);
             const f = {
                 name: m.name, size: m.size, mtime: m.mtime, ranges,
                 covered: coveredBytes(ranges), dirty: false, sha: null,
+                seq: savedSeq.get(m.id) ?? 0, jfails: 0,
                 finalizing: false, done: false,
             };
             files.set(m.id, f);
@@ -304,14 +417,17 @@ onmessage = async (e) => {
                 f.access = await f.handle.createSyncAccessHandle();
                 if (m.fresh) f.access.truncate(0); // drop bytes from any older stage
                 f.access.truncate(m.size);
-                f.jhandle = await (await dir.getFileHandle("f" + m.id + ".json", { create: true })).createSyncAccessHandle();
+                f.slots = [
+                    await (await dir.getFileHandle("f" + m.id + ".json", { create: true })).createSyncAccessHandle(),
+                    await (await dir.getFileHandle("f" + m.id + ".json.b", { create: true })).createSyncAccessHandle(),
+                ];
                 await checkDone(m.id, f); // 0-byte files need no chunks
             })();
             await f.ready;
         } else if (m.op === "write") {
             const f = files.get(m.id);
             await f.ready;
-            if (f.done || f.finalizing) return;
+            if (f.done || f.finalizing || f.sealed) return;
             f.access.write(new Uint8Array(m.buf, m.off, m.len), { at: m.pos });
             f.covered += addRange(f.ranges, m.pos, m.pos + m.len);
             f.dirty = true;
@@ -323,6 +439,10 @@ onmessage = async (e) => {
                 f.sha = m.sha;
                 await checkDone(m.id, f);
             }
+        } else if (m.op === "complete") { // whole transfer landed
+            metaDone = true;
+            writeMeta();
+            try { metaAccess.close(); } catch {}
         }
     } catch (err) {
         postMessage({ op: "error", message: String((err && err.message) || err) });
@@ -490,6 +610,7 @@ function sendMode() {
             t0 = Date.now();
             let sent = 0;
             let mi = 0;
+            let lastPing = Date.now();
             const chunkSize = mmsChunk(a);
             for (let fi = 0; fi < files.length; fi++) {
                 const f = files[fi];
@@ -504,6 +625,13 @@ function sendMode() {
                     if (a.dead) {
                         reader.cancel?.();
                         throw ABORT;
+                    }
+                    // a resumed transfer scans its covered prefix without
+                    // sending a frame — keep the receiver from mistaking
+                    // the silence for a dead peer and reconnecting
+                    if (Date.now() - lastPing > 5000) {
+                        lastPing = Date.now();
+                        sendCtl(a, { t: "ping" });
                     }
                     // block hashing rides the same sequential read
                     let off = 0;
@@ -609,8 +737,10 @@ function sendMode() {
             a.conns[0] = c0;
             pc.onconnectionstatechange = () => {
                 if (pc.connectionState === "failed" && !a.dead) {
-                    if (!acceptedEver && at === a) fatal(T.p2pFail);
-                    lost(a);
+                    if (!acceptedEver && at === a) {
+                        teardown(a);
+                        fatal(T.p2pFail); // keep the TURN hint visible — lost() would overwrite it
+                    } else lost(a);
                 }
             };
             const ch = pc.createDataChannel("freedrop", { ordered: true });
@@ -697,6 +827,18 @@ async function receive(codeStr) {
     status(T.connecting);
     if (!navigator.storage?.getDirectory) throw new Error(T.tooOld);
     const rid = hex(await crypto.subtle.digest("SHA-256", enc.encode(`freedrop-stage:${codeStr}`))).slice(0, 20);
+    // two tabs on the same link would share the OPFS stage and corrupt
+    // each other (truncating slots mid-verify, clobbering journals) —
+    // hold a web lock for the page's lifetime, refuse if already held
+    if (navigator.locks) {
+        const granted = await new Promise((resolve) => {
+            navigator.locks.request(`freedrop-recv-${rid}`, { ifAvailable: true }, (lock) => {
+                resolve(!!lock);
+                if (lock) return new Promise(() => {}); // held until the page dies
+            }).catch(() => resolve(true));
+        });
+        if (!granted) throw new Error(T.busyTab);
+    }
     const worker = new Worker(URL.createObjectURL(new Blob([WORKER_SRC], { type: "text/javascript" })));
     const saved = await new Promise((resolve, reject) => {
         worker.onmessage = (e) => (e.data.op === "state" ? resolve(e.data.entries) : reject(new Error(T.tooOld)));
@@ -718,7 +860,9 @@ async function receive(codeStr) {
     let acceptedEver = false;
     let staged = false;
     let finished = false;
+    let failed = false;
     let moreRounds = 0;
+    let coveredAtEof = -1;
 
     // ---- attempt state ----
     let at = null; // { sid, pcs: [{ pc, ch, rx, last }], dc, gotOffer }
@@ -765,7 +909,9 @@ async function receive(codeStr) {
     };
 
     const finish = () => {
+        if (finished || failed) return;
         finished = true;
+        worker.postMessage({ op: "complete" }); // mark the stage sweepable
         sendCtl({ t: "done" });
         bar(1);
         status(T.doneRecv(fmtSize(total), ((Date.now() - t0) / 1000).toFixed(1)));
@@ -776,6 +922,7 @@ async function receive(codeStr) {
     // and its list row becomes a link, for when the browser blocks the
     // automatic click (multi-file transfers, mobile quirks)
     const onFileReady = (i, file) => {
+        if (failed) return;
         const f = vfiles[i];
         if (f.done) return;
         f.done = true;
@@ -796,15 +943,24 @@ async function receive(codeStr) {
         if (++completed === vfiles.length) finish();
     };
 
+    // terminal failures: stop timers and connections first, so nothing
+    // (health timer, a later finish) can overwrite the message — the
+    // ledger still claims the bytes the worker just discarded
+    const fail = (text) => {
+        failed = true;
+        stop();
+        fatal(text);
+    };
     worker.onmessage = (e) => {
         const m = e.data;
         if (m.op === "file") onFileReady(m.id, m.file);
-        else if (m.op === "badhash") fatal(T.badhash(m.name));
-        else if (m.op === "error") fatal(m.message);
+        else if (m.op === "badhash") fail(T.badhash(m.name));
+        else if (m.op === "error") fail(m.message);
     };
-    worker.onerror = (e) => fatal(String(e.message ?? e));
+    worker.onerror = (e) => fail(String(e.message ?? e));
 
     const onChunk = (offset, chunk) => {
+        if (failed) return; // late stripe data must not repaint a terminal error
         const f = fileAt(offset);
         const local = offset - f.base;
         if (local + chunk.length > f.size) return fatal("data outside any file");
@@ -832,7 +988,8 @@ async function receive(codeStr) {
             for (const f of vfiles) {
                 worker.postMessage({
                     op: "open", id: f.i, name: f.name, size: f.size, mtime: f.mtime,
-                    fresh: !f.resumed, ranges: f.resumed ? f.ranges : [],
+                    done: f.priorDone, fresh: !f.resumed && !f.priorDone,
+                    ranges: f.resumed ? f.ranges : [],
                 });
             }
         }
@@ -844,7 +1001,7 @@ async function receive(codeStr) {
             // a reconnect re-sends the manifest — it must be the same transfer
             const same = m.files.length === manifest.length && m.files.every((mf, i) =>
                 mf.name === manifest[i].name && mf.size === manifest[i].size && mf.mtime === manifest[i].mtime);
-            if (!same) return fatal(T.declined);
+            if (!same) return fail(T.declined); // terminal — retrying would loop forever
             if (acceptedEver) acceptNow();
             return;
         }
@@ -855,10 +1012,13 @@ async function receive(codeStr) {
         vfiles = manifest.map((mf, i) => {
             const prior = saved.find((s) =>
                 s.i === i && s.name === mf.name && s.size === mf.size && s.mtime === mf.mtime);
-            const ranges = prior ? cleanRanges(prior.ranges, mf.size) : [];
+            const priorDone = !!prior?.done; // verified by an earlier visit
+            const ranges = priorDone ? [[0, mf.size]]
+                : prior ? cleanRanges(prior.ranges, mf.size) : [];
             const entry = {
                 i, name: mf.name, size: mf.size, mtime: mf.mtime, base,
-                resumed: !!prior, ranges, covered: coveredBytes(ranges),
+                resumed: !!prior && !priorDone, priorDone, ranges,
+                covered: priorDone ? mf.size : coveredBytes(ranges),
                 sha: null, done: false,
             };
             coveredTotal += entry.covered;
@@ -886,9 +1046,19 @@ async function receive(codeStr) {
         $("actions").appendChild(btn);
     };
 
-    const onEof = () => {
-        if (finished || coveredTotal === total) return; // verification will finish it
-        if (++moreRounds > 5) return fatal(T.p2pFail);
+    // eof races the stripes: it rides connection 0 while other stripes
+    // may still hold megabytes in flight — judge gaps only once the pipe
+    // has drained, and count only DRY rounds toward the give-up
+    const onEof = async () => {
+        for (;;) {
+            const seen = coveredTotal;
+            await new Promise((r) => setTimeout(r, 1500));
+            if (coveredTotal === seen) break;
+        }
+        if (finished || failed || !at || coveredTotal === total) return;
+        if (coveredTotal > coveredAtEof) moreRounds = 0;
+        coveredAtEof = coveredTotal;
+        if (++moreRounds > 5) return fail(T.p2pFail);
         // gap chunks arrive at lower offsets than the stripes have seen;
         // lift the per-channel replay guard for the new round
         for (const c of at.pcs) if (c) c.last = -1;
@@ -898,7 +1068,10 @@ async function receive(codeStr) {
     const onFrame = (c, ev) => {
         const { msg, chunk, offset } = parseFrame(ev.data);
         lastData = Date.now();
-        disconnectedAt = 0;
+        // a manifest only proves the attempt negotiated, not that the
+        // transfer progresses — clearing the clock on it would let an
+        // endless reconnect loop dodge the give-up window forever
+        if (chunk || msg.t !== "manifest") disconnectedAt = 0;
         if (chunk) {
             if (offset <= c.last) return; // engine replayed a message
             c.last = offset;
@@ -930,10 +1103,11 @@ async function receive(codeStr) {
     };
 
     const retry = () => {
-        if (finished) return;
-        if (!acceptedEver) {
-            // never carried data — almost always NAT, and retrying the
-            // same pair of networks will not do better
+        if (finished || failed) return;
+        if (!acceptedEver && !manifest) {
+            // the channel never proved itself — almost always NAT. A
+            // failure AFTER the manifest crossed (user at the Save
+            // button) is not NAT: fall through and reconnect quietly.
             if (connectedOnce) fatal(T.p2pFail);
             return; // pre-connection: the hello re-send loop is still trying
         }

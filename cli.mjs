@@ -7,17 +7,18 @@
 // the WebRTC DataChannel: direct P2P, DTLS-encrypted, never through any
 // server. TURN (--turn) is the opt-in relay for NATs P2P can't punch.
 //
-// Transfers are resumable and verified. The receiver stages each file as
-// <name>.part and journals the byte ranges already on disk in
-// <name>.part.state; any re-negotiation — the same processes after a
-// network blip, or fresh runs (`freedrop <code>` to receive again,
+// Transfers are resumable and verified. The receiver stages incoming
+// bytes in an opaque directory (.freedrop-stage/<rid>/<slot>.part with a
+// range journal per slot); any re-negotiation — the same processes after
+// a network blip, or fresh runs (`freedrop <code>` to receive again,
 // `freedrop --code <code> <files>` to send again) — picks up from the
-// journal and transfers only what is missing. A file is renamed into
-// place only after its content matches the sender's hash.
+// journal and transfers only what is missing. A file appears under its
+// final name only after its content matches the sender's hash, and the
+// staging directory disappears when the whole transfer lands.
 
 import {
     createReadStream, existsSync, statSync, readdirSync, readFileSync,
-    writeFileSync, renameSync, rmSync,
+    writeFileSync, renameSync, rmSync, mkdirSync, rmdirSync, linkSync,
 } from "node:fs";
 import { open } from "node:fs/promises";
 import { basename, join } from "node:path";
@@ -25,6 +26,7 @@ import { randomBytes, createHash } from "node:crypto";
 import { createInterface } from "node:readline";
 import qrcode from "qrcode-terminal";
 import { SignalRoom, b64u, DEFAULT_BROKERS } from "./signal.mjs";
+import { acquireLeaseLock } from "./lock.mjs";
 
 const PAGE = process.env.FREEDROP_PAGE ?? "https://freedrop.dev/";
 
@@ -60,6 +62,10 @@ Docs: https://github.com/tiann/freedrop`;
 
 // ---- tiny arg parser -------------------------------------------------------
 
+// codes are base64url, so 1 in 64 starts with "-" — the parser must
+// recognize them before treating a leading dash as an option
+const looksLikeCode = (s) => /^[A-Za-z0-9_-]{40,48}$/.test(s);
+
 const flags = {};
 const rest = [];
 {
@@ -83,7 +89,7 @@ const rest = [];
         else if (a === "--turn") flags.turn = argv[++i];
         else if (a === "--turn-auth") flags.turnAuth = argv[++i];
         else if (a === "--broker") flags.broker = argv[++i];
-        else if (a.startsWith("-")) {
+        else if (a.startsWith("-") && !looksLikeCode(a)) {
             console.error(`unknown option: ${a}\nrun freedrop --help for usage`);
             process.exit(1);
         } else rest.push(a);
@@ -387,6 +393,10 @@ const die = (msg) => {
 
 const dbg = process.env.FREEDROP_DEBUG ? (...a) => console.error("\n[dbg]", ...a) : null;
 
+// test hook: cap the send rate (bytes/second) so interruption tests get
+// a deterministic mid-transfer window on any machine
+const BPS = Number(process.env.FREEDROP_BPS ?? 0);
+
 const shellQuote = (s) => (/^[\w./+=:,-]+$/.test(s) ? s : `'${s.replaceAll("'", "'\\''")}'`);
 
 const ABORT = Symbol("attempt aborted");
@@ -516,6 +526,7 @@ async function send(paths) {
         t0.v = Date.now();
         let sent = 0;
         let mi = 0;
+        let lastPing = Date.now();
         for (let fi = 0; fi < files.length; fi++) {
             const f = files[fi];
             const hasher = new BlockHasher();
@@ -524,6 +535,14 @@ async function send(paths) {
                 for await (const block of createReadStream(f.path, { highWaterMark: 4 * 1024 * 1024 })) {
                     if (a.dead) throw ABORT;
                     hasher.update(block);
+                    // a resumed transfer scans its covered prefix without
+                    // sending a single frame — minutes of silence on a big
+                    // file, which the receiver would mistake for a dead
+                    // peer and reconnect (restarting this very scan)
+                    if (Date.now() - lastPing > 5000) {
+                        lastPing = Date.now();
+                        sendCtl(a, { t: "ping" });
+                    }
                     const gs = bases[fi] + local;
                     const ge = gs + block.length;
                     while (mi < missing.length && missing[mi][1] <= gs) mi++;
@@ -536,6 +555,10 @@ async function send(paths) {
                             sendChunk(a, c, p, block.subarray(p - gs, q - gs));
                             sent += q - p;
                             progressLine("sending", sent, need, t0.v);
+                            if (BPS) {
+                                const ahead = (sent / BPS) * 1000 - (Date.now() - t0.v);
+                                if (ahead > 50) await new Promise((r) => setTimeout(r, ahead));
+                            }
                         }
                     }
                     local += block.length;
@@ -722,17 +745,29 @@ async function send(paths) {
 }
 
 // ---- receive ----------------------------------------------------------------
-// Positional writes keyed by global offset land in <name>.part; coverage
-// lives in an interval set journaled to <name>.part.state (atomically,
-// twice a second). When a file is fully covered AND its hash frame has
-// arrived, the .part is re-read, verified, and renamed into place; the
-// journal disappears with it. Connection loss at any point tears down
-// the attempt and re-hellos — the same journal drives the accept {have}
-// of the next attempt, in this process or a later one.
+// Positional writes keyed by global offset land in an opaque staging
+// directory — .freedrop-stage/<rid>/<slot>.part plus a per-slot range
+// journal, flushed atomically twice a second. Identity is structural:
+// the rid names the transfer (a hash of the code), the slot is the
+// file's manifest index, so resume never matches filenames and staging
+// never shares the user-visible namespace (no ".part" suffix can ever
+// alias a legitimate file). When a slot is fully covered AND its hash
+// frame has arrived, the stage is re-read, verified, and only then
+// renamed to a final name chosen at that moment; the whole staging
+// directory disappears once the transfer completes. Connection loss at
+// any point tears down the attempt and re-hellos — the same journals
+// drive the accept {have} of the next attempt, in this process or a
+// later one.
 
 async function receive(code) {
     const key = b64u.decode(code);
     const outDir = flags.out ?? ".";
+    // the staging directory is named by a hash of the code — never the
+    // code itself (it sits on disk) — so unrelated transfers into the
+    // same directory get disjoint staging by construction
+    const rid = createHash("sha256").update(`freedrop-stage:${code}`).digest("hex").slice(0, 20);
+    const stageRoot = join(outDir, ".freedrop-stage");
+    const stageDir = join(stageRoot, rid);
     const turnExtra = await turnServers();
     const room = await SignalRoom.create({ key, role: "viewer", brokers: BROKERS })
         .catch((e) => die(`cannot reach any rendezvous broker: ${e.message}`));
@@ -748,7 +783,9 @@ async function receive(code) {
     let finished = false;
     let pendingWrites = 0;
     let moreRounds = 0;
-    const taken = new Set(); // paths reserved before their files exist
+    let coveredAtEof = -1;
+    let stagedOnce = false;
+    const taken = new Set(); // final paths claimed by this run's landings
 
     // ---- attempt state ----
     let at = null; // { sid, pcs: [{ pc, ch, rx, last }], dc, gotOffer }
@@ -757,19 +794,19 @@ async function receive(code) {
     let disconnectedAt = 0;
     let lastData = Date.now();
 
-    const partPath = (f) => f.path + ".part";
-    const statePath = (f) => f.path + ".part.state";
+    const partPath = (f) => join(stageDir, `${f.i}.part`);
+    const statePath = (f) => join(stageDir, `${f.i}.json`);
 
     const flushStates = () => {
         for (const f of files ?? []) {
             if (!f.dirty || f.done) continue;
-            f.dirty = false;
             try { // atomic: a torn journal must parse as garbage, not lie
                 const tmp = statePath(f) + ".tmp";
                 writeFileSync(tmp, JSON.stringify({
-                    v: 2, name: f.name, size: f.size, mtime: f.mtime, ranges: f.ranges,
+                    v: 3, name: f.name, size: f.size, mtime: f.mtime, ranges: f.ranges,
                 }));
                 renameSync(tmp, statePath(f));
+                f.dirty = false; // only a landed journal counts as flushed
             } catch {}
         }
     };
@@ -794,33 +831,131 @@ async function receive(code) {
         process.exit(1);
     };
 
-    // journals left by an interrupted run, matched by name+size+mtime —
-    // a changed source file must not resume into stale bytes
-    const loadJournals = () => {
-        const found = [];
-        let names = [];
-        try { names = readdirSync(outDir); } catch {}
-        for (const n of names) {
-            if (!n.endsWith(".part.state")) continue;
-            try {
-                const st = JSON.parse(readFileSync(join(outDir, n), "utf8"));
-                const part = join(outDir, n.slice(0, -".state".length));
-                if (st.v === 2 && existsSync(part)) found.push({ ...st, part, claimed: false });
-            } catch {} // torn or foreign journal — ignore
+    // the journal for one manifest slot, if it is valid for this
+    // manifest entry. Metadata (name/size/mtime) is a VALIDITY check —
+    // identity is the slot itself, so nothing here ever matches
+    // filenames or other transfers' staging. Invalid slots are
+    // reclaimed on sight. Landing is a two-state transaction: claiming
+    // is written before the atomic link/rename, landed afterwards. A
+    // crash at either boundary can therefore be distinguished from an
+    // unrelated same-name file without trusting the old working directory.
+    const loadSlot = (i, mf) => {
+        const sp = join(stageDir, `${i}.json`);
+        const pp = join(stageDir, `${i}.part`);
+        let st = null;
+        try { st = JSON.parse(readFileSync(sp, "utf8")); } catch {}
+        if (st && st.v === 3 && st.name === mf.name && st.size === mf.size && st.mtime === mf.mtime) {
+            // New markers persist only a basename; legacy v3 markers are
+            // migrated by taking their basename too. Both resolve against
+            // THIS run's outDir, never the process cwd that wrote the marker.
+            const rawFinal = typeof st.finalName === "string" ? st.finalName
+                : typeof st.path === "string" ? basename(st.path) : null;
+            const finalName = rawFinal && basename(rawFinal) === rawFinal ? rawFinal : null;
+            const fp = finalName ? join(outDir, finalName) : null;
+            const partExists = existsSync(pp);
+            let finalExists = false;
+            try { finalExists = !!fp && statSync(fp).size === mf.size; } catch {}
+
+            if (finalExists && st.done) {
+                // A committed marker is authoritative. For a legacy marker
+                // that may have been written before an EEXIST result, require
+                // either no stage (rename landed) or the same inode (link landed).
+                if (st.landed || !partExists) return { done: true, path: fp };
+                try {
+                    const a = statSync(pp);
+                    const b = statSync(fp);
+                    if (a.dev === b.dev && a.ino === b.ino) return { done: true, path: fp };
+                } catch {}
+            }
+            if (finalExists && st.claiming) {
+                // rename success removes the stage; link success leaves the
+                // same inode at both paths until the committed marker lands.
+                if (!partExists) return { done: true, path: fp };
+                try {
+                    const a = statSync(pp);
+                    const b = statSync(fp);
+                    if (a.dev === b.dev && a.ino === b.ino) return { done: true, path: fp };
+                } catch {}
+            }
+            if (partExists) {
+                return { ranges: st.done || st.claiming ? [[0, mf.size]] : cleanRanges(st.ranges, mf.size) };
+            }
         }
-        return found;
+        // invalid or stale — reclaimed at accept time, never before the
+        // user consents (a declined offer must not cost staged data)
+        return null;
     };
 
-    // avoid clobbering: aaa.txt -> aaa(1).txt (also dodge foreign .part staging)
-    const freshPath = (name) => {
-        const safe = basename(name);
-        let p = join(outDir, safe);
-        for (let n = 1; existsSync(p) || existsSync(p + ".part") || taken.has(p); n++) {
-            const dot = safe.lastIndexOf(".");
-            p = join(outDir, dot > 0 ? `${safe.slice(0, dot)}(${n})${safe.slice(dot)}` : `${safe}(${n})`);
+    const acquireStageLock = () => {
+        const lockPath = join(stageDir, "lock");
+        const busy = "\nanother freedrop is already receiving this transfer into this directory.\nrun one receiver at a time.";
+        try { acquireLeaseLock(lockPath, { waitMs: 3000, pollMs: 100 }); }
+        catch (e) {
+            if (e.code === "ELOCKED") die(busy);
+            die(`\ncannot acquire the staging lock: ${e.message}`);
         }
-        taken.add(p);
-        return p;
+    };
+
+    const writeLandingState = (f, state) => {
+        const tmp = statePath(f) + ".tmp";
+        writeFileSync(tmp, JSON.stringify({
+            v: 3, name: f.name, size: f.size, mtime: f.mtime, ...state,
+        }));
+        renameSync(tmp, statePath(f));
+    };
+
+    // Land a verified stage under a final name. Hard links provide an
+    // atomic no-replace claim where supported. Filesystems without them
+    // serialize all freedrop landings under stageRoot, re-check the name,
+    // then rename the already-verified stage atomically — no clean-name
+    // destination is ever visible half-copied.
+    const land = (f) => {
+        const safe = basename(f.name);
+        for (let n = 0; ; n++) {
+            const dot = safe.lastIndexOf(".");
+            const finalName = n === 0 ? safe
+                : dot > 0 ? `${safe.slice(0, dot)}(${n})${safe.slice(dot)}` : `${safe}(${n})`;
+            const cand = join(outDir, finalName);
+            if (taken.has(cand)) continue;
+
+            // PRECONDITION marker. A crash before the claim resumes from the
+            // full stage; a crash after link/rename is recognized by inode or
+            // by the stage path having disappeared.
+            writeLandingState(f, { claiming: true, finalName });
+            let linked = false;
+            try {
+                linkSync(partPath(f), cand);
+                linked = true;
+            } catch (e) {
+                if (e.code === "EEXIST") continue;
+                let release = null;
+                try {
+                    release = acquireLeaseLock(join(stageRoot, ".land-lock"), {
+                        waitMs: 10_000, pollMs: 25,
+                    });
+                    if (existsSync(cand)) continue;
+                    try { renameSync(partPath(f), cand); }
+                    catch (moveErr) {
+                        if (moveErr.code === "EXDEV") {
+                            throw new Error(
+                                "the staging directory and output directory are on different filesystems",
+                            );
+                        }
+                        throw moveErr;
+                    }
+                    // Commit while the cross-transfer name lock is still held.
+                    writeLandingState(f, { done: true, landed: true, finalName });
+                } finally {
+                    release?.();
+                }
+            }
+            if (linked) {
+                writeLandingState(f, { done: true, landed: true, finalName });
+                rmSync(partPath(f), { force: true });
+            }
+            taken.add(cand);
+            return cand;
+        }
     };
 
     // the manifest only ever arrives over the DataChannel, so any reply
@@ -836,11 +971,18 @@ async function receive(code) {
     };
 
     const finishAll = () => {
+        if (finished) return;
         finished = true;
+        try { // the stage is spent; the root stays only if other transfers use it
+            rmSync(stageDir, { recursive: true, force: true });
+            rmdirSync(stageRoot);
+        } catch {}
+        const notified = at?.dc?.readyState === "open";
         sendCtl({ t: "done" });
         const secs = ((Date.now() - t0) / 1000).toFixed(1);
         status("");
         console.log(`✓ received ${fmtSize(total)} in ${secs}s — verified`);
+        if (!notified) console.log("(the sender could not be told — if it is still running, Ctrl-C it)");
         setTimeout(() => {
             teardownAttempt();
             room.close();
@@ -859,10 +1001,12 @@ async function receive(code) {
         return files[lo];
     };
 
-    // fully covered + hash arrived → verify the staged bytes, then rename.
-    // Verification is local re-read; a mismatch means the sender's file
-    // changed between runs (or corruption) — the stage is discarded so the
-    // next run starts clean instead of resuming into garbage forever.
+    // fully covered + hash arrived → verify, then land it. Verification
+    // re-reads the staged .part — or the final file for a done-marker
+    // claim, which never skips this step: a source swapped since the
+    // last run (same name/size/mtime, new bytes) must fail here, not
+    // "succeed" with old ones. A mismatch discards the stage or the
+    // marker so the next run starts clean instead of looping forever.
     const maybeFinalize = (f) => {
         if (f.done || f.finalizing || !f.sha || f.covered !== f.size) return;
         f.finalizing = true;
@@ -871,28 +1015,36 @@ async function receive(code) {
             await f.fh?.close();
             const hasher = new BlockHasher();
             if (f.size > 0) {
-                for await (const b of createReadStream(partPath(f))) hasher.update(b);
+                for await (const b of createReadStream(f.inPlace ? f.path : partPath(f))) hasher.update(b);
             }
             if (hasher.digest() !== f.sha) {
-                rmSync(partPath(f), { force: true });
                 rmSync(statePath(f), { force: true });
+                if (f.inPlace) { // keep the old file — it is finished user data
+                    die(
+                        `\n${basename(f.name)}: the copy received earlier no longer matches ` +
+                        "the sender's file (same name/size/mtime, different content).\n" +
+                        "re-run to transfer the new version — it will land beside the old one.",
+                    );
+                }
+                rmSync(partPath(f), { force: true });
                 die(
-                    `\n${basename(f.path)}: verification failed — the sender's file changed, ` +
+                    `\n${basename(f.name)}: verification failed — the sender's file changed, ` +
                     "or data was corrupted.\npartial data discarded; re-run to transfer it fresh.",
                 );
             }
-            renameSync(partPath(f), f.path);
-            rmSync(statePath(f), { force: true });
+            if (!f.inPlace) f.path = land(f);
             f.done = true;
             if (++completed === files.length) finishAll();
-        })().catch((e) => die(`\n${basename(f.path)}: ${e.message}`));
+        })().catch((e) => die(`\n${basename(f.name)}: ${e.message}`));
     };
 
     const onChunk = (offset, chunk) => {
         const f = fileAt(offset);
         const local = offset - f.base;
         if (local + chunk.length > f.size) die("\ndata outside any file — aborting");
-        if (f.done || f.finalizing) return; // late duplicate after verification began
+        // late duplicates after verification began, or strays aimed at a
+        // done-marker claim (its final file is not writable staging)
+        if (f.done || f.finalizing || f.inPlace) return;
         if (!f.opening) {
             // resumed stages reopen in place ("w" would truncate them)
             f.opening = open(partPath(f), f.resumed ? "r+" : "w").then(async (fh) => {
@@ -909,15 +1061,36 @@ async function receive(code) {
             f.dirty = true;
             maybeFinalize(f);
             progressLine("receiving", coveredTotal, total, t0);
-        }).catch((e) => die(`\n${basename(f.path)}: ${e.message}`));
+        }).catch((e) => die(`\n${basename(f.name)}: ${e.message}`));
     };
 
     const acceptNow = () => {
         acceptedEver = true;
         if (!t0) t0 = Date.now();
+        if (!stagedOnce) {
+            stagedOnce = true;
+            mkdirSync(stageDir, { recursive: true });
+            // two receivers with the same code in one directory would
+            // silently corrupt each other's slots — refuse loudly. The
+            // directory lease is born atomically; stale-owner deletion is
+            // serialized, and creators are excluded throughout recovery.
+            acquireStageLock();
+            // reclaim stale staging now that the user has accepted:
+            // fresh slots' leftovers, and slots beyond this manifest
+            try {
+                for (const n of readdirSync(stageDir)) {
+                    if (n === "lock") continue;
+                    const m = /^(\d+)\./.exec(n);
+                    const f = m ? files[Number(m[1])] : null;
+                    if (!f || (!f.resumed && !f.inPlace && !f.opening)) {
+                        rmSync(join(stageDir, n), { force: true });
+                    }
+                }
+            } catch {}
+        }
         // empty files get no chunks — stage them right away
         for (const f of files) {
-            if (f.size > 0 || f.opening) continue;
+            if (f.size > 0 || f.inPlace || f.opening) continue;
             f.opening = open(partPath(f), "w").then((fh) => { f.fh = fh; });
             maybeFinalize(f);
         }
@@ -935,39 +1108,20 @@ async function receive(code) {
         }
         manifest = m.files;
         total = manifest.reduce((n, f) => n + f.size, 0);
-        const journals = loadJournals();
         let base = 0;
         coveredTotal = 0;
+        completed = 0;
         files = manifest.map((mf, i) => {
-            const prior = journals.find((j) =>
-                !j.claimed && j.name === mf.name && j.size === mf.size && j.mtime === mf.mtime);
-            let path;
-            let ranges = [];
-            if (prior) {
-                prior.claimed = true;
-                path = prior.part.slice(0, -".part".length);
-                taken.add(path);
-                ranges = cleanRanges(prior.ranges, mf.size);
-            } else {
-                // a stale journal for this name (the source changed since
-                // that run) would block the clean filename forever —
-                // reclaim it, unless its stage was written in the last few
-                // seconds (then it belongs to a live sibling receiver)
-                for (const j of journals) {
-                    if (j.claimed || j.name !== mf.name) continue;
-                    try {
-                        if (statSync(j.part).mtimeMs > Date.now() - 10_000) continue;
-                        j.claimed = true;
-                        rmSync(j.part, { force: true });
-                        rmSync(j.part + ".state", { force: true });
-                    } catch {}
-                }
-                path = freshPath(mf.name);
-            }
+            const prior = loadSlot(i, mf);
+            const inPlace = !!prior?.done; // complete on disk — but it must
+            // still prove itself against THIS run's hash: the source may
+            // have been swapped since (same name/size/mtime, new bytes)
+            const ranges = prior?.ranges ?? (inPlace ? [[0, mf.size]] : []);
             const entry = {
-                i, name: mf.name, size: mf.size, mtime: mf.mtime, base, path,
-                resumed: !!prior, fh: null, opening: null, ranges,
-                covered: coveredBytes(ranges), dirty: false, sha: null,
+                i, name: mf.name, size: mf.size, mtime: mf.mtime, base,
+                path: inPlace ? prior.path : null, // chosen at landing time
+                resumed: !!prior && !inPlace, inPlace, fh: null, opening: null, ranges,
+                covered: inPlace ? mf.size : coveredBytes(ranges), dirty: false, sha: null,
                 finalizing: false, done: false,
             };
             coveredTotal += entry.covered;
@@ -992,11 +1146,20 @@ async function receive(code) {
         });
     };
 
-    // after eof, wait for in-flight writes to settle, then either let
-    // verification finish the job or report the gaps for a fill round
+    // eof races the stripes: it rides connection 0 while other stripes
+    // may still hold megabytes in flight, so "gaps" at eof are usually
+    // just data still in the pipe. Judge only once the pipe has drained,
+    // and count only DRY rounds toward the give-up — a round that
+    // delivered bytes is progress, not loss.
     const onEof = async () => {
-        while (pendingWrites > 0) await new Promise((r) => setTimeout(r, 50));
+        for (;;) {
+            const seen = coveredTotal;
+            await new Promise((r) => setTimeout(r, 1500));
+            if (coveredTotal === seen && pendingWrites === 0) break;
+        }
         if (finished || coveredTotal === total) return;
+        if (coveredTotal > coveredAtEof) moreRounds = 0;
+        coveredAtEof = coveredTotal;
         if (++moreRounds > 5) die("\ntransfer cannot complete — data lost on every fill round");
         dbg?.(`eof with gaps — requesting fill round ${moreRounds}`);
         // gap chunks arrive at lower offsets than the stripes have seen;
@@ -1008,7 +1171,10 @@ async function receive(code) {
     const onFrame = (c, ev) => {
         const { msg, chunk, offset } = parseFrame(ev.data);
         lastData = Date.now();
-        disconnectedAt = 0;
+        // a manifest only proves the attempt negotiated, not that the
+        // transfer progresses — if it cleared the clock, an endless
+        // reconnect loop could never reach the give-up window
+        if (chunk || msg.t !== "manifest") disconnectedAt = 0;
         if (chunk) {
             if (offset <= c.last) return; // engine replayed a message
             c.last = offset;
@@ -1042,9 +1208,11 @@ async function receive(code) {
     const retry = (why) => {
         if (finished) return;
         dbg?.(`retry: ${why}`);
-        if (!acceptedEver) {
-            // never carried data — almost always NAT, and retrying the
-            // same pair of networks will not do better
+        if (!acceptedEver && !manifest) {
+            // the channel never proved itself — almost always NAT, and
+            // retrying the same pair of networks will not do better. A
+            // failure AFTER the manifest crossed (say, while the user
+            // reads the prompt) is not NAT: fall through and reconnect.
             if (connectedOnce) die(NAT_HINT);
             return; // pre-connection: the hello re-send loop is still trying
         }
@@ -1143,8 +1311,6 @@ async function receive(code) {
 }
 
 // ---- dispatch ---------------------------------------------------------------
-
-const looksLikeCode = (s) => /^[A-Za-z0-9_-]{40,48}$/.test(s);
 
 if (rest.length === 0) {
     console.log(HELP);
