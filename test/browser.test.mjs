@@ -87,8 +87,18 @@ const saveDownloads = async (page, got, names) => {
     return out;
 };
 
-const pageDone = (page, ms = 120_000) =>
-    waitFor(() => page.locator("#status").textContent().then((s) => s.includes("✓")), ms, "✓ in #status");
+const pageDone = async (page, ms = 120_000) => {
+    try {
+        await waitFor(() => page.locator("#status").textContent().then((s) => s.includes("✓")), ms, "✓ in #status");
+    } catch (error) {
+        const state = await page.evaluate(() => ({
+            status: document.getElementById("status").textContent,
+            actions: document.getElementById("actions").textContent,
+            progress: document.querySelector("#bar div").style.width,
+        })).catch(String);
+        throw new Error(`${error.message}; page state: ${JSON.stringify(state)}`, { cause: error });
+    }
+};
 
 // Exercise public-broker reordering deterministically, even on loopback.
 // SDP can trail trickled ICE, and installing it is itself asynchronous.
@@ -363,7 +373,10 @@ test("CLI → browser: reload mid-transfer resumes; verified files come back fro
     await waitFor(() => page.locator("#bar div").evaluate((el) => parseInt(el.style.width) >= 20),
         60_000, "partial progress");
     await page.reload(); // same link, same OPFS — must auto-resume, no Save button
-    await pageDone(page);
+    await pageDone(page).catch((error) => {
+        console.log(`  [reload sender] ${sender.out}`);
+        throw error;
+    });
     const hashes = await saveDownloads(page, got, ["big.bin", "small.bin"]);
     for (const n of Object.keys(hashes)) assert.equal(hashes[n], await sha256(join(W, n)), n);
     assert.match(sender.out, /resuming/, "the sender must see a resume, not a restart");
