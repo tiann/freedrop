@@ -359,6 +359,63 @@ test("browser → browser: multi-file with ICE before offers and answers", { tim
     await recvPage.context().close();
 });
 
+test("CLI → browser: waits for the previous page's OPFS handle to close", { timeout: 45_000 }, async (t) => {
+    const W = makeDir(join(TMP, "storage-handoff"));
+    await makeRandom(join(W, "aaa.txt"), 1024);
+    const sender = startCli(["--no-qr", join(W, "aaa.txt")]);
+    t.after(() => sender.kill("SIGKILL"));
+    const code = await transferCode(sender);
+
+    // Page navigation can release the Web Lock before Chromium has
+    // closed the old worker's OPFS handles. Hold the actual meta file
+    // from a second worker to exercise that storage handoff directly.
+    const owner = await newPage("storage-owner");
+    t.after(() => owner.context().close());
+    await owner.goto(BASE);
+    await owner.evaluate(async (code) => {
+        const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`freedrop-stage:${code}`));
+        const rid = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("").slice(0, 20);
+        const top = await (await navigator.storage.getDirectory()).getDirectoryHandle("freedrop", { create: true });
+        const dir = await top.getDirectoryHandle(rid, { create: true });
+        const handle = await dir.getFileHandle("meta", { create: true });
+        const worker = new Worker(URL.createObjectURL(new Blob([`
+            let access;
+            onmessage = async ({ data }) => {
+                if (data === "release") {
+                    access.close();
+                    postMessage("released");
+                    close();
+                } else {
+                    access = await data.createSyncAccessHandle();
+                    postMessage("locked");
+                }
+            };
+        `], { type: "text/javascript" })));
+        await new Promise((resolve, reject) => {
+            worker.onmessage = resolve;
+            worker.onerror = reject;
+            worker.postMessage(handle);
+        });
+        window.releaseStage = () => new Promise((resolve) => {
+            worker.onmessage = resolve;
+            worker.postMessage("release");
+        });
+    }, code);
+
+    const page = await owner.context().newPage();
+    const got = collectDownloads(page);
+    const ready = page.waitForEvent("worker");
+    await page.goto(`${BASE}/#${code}`);
+    await ready;
+    await sleep(250);
+    await owner.evaluate(() => window.releaseStage());
+    await page.getByRole("button", { name: /Save|保存/ }).click({ timeout: 10_000 });
+    await pageDone(page);
+    const hashes = await saveDownloads(page, got, ["aaa.txt"]);
+    assert.equal(hashes["aaa.txt"], await sha256(join(W, "aaa.txt")));
+    assert.equal(await exited(sender), 0, sender.out);
+});
+
 test("CLI → browser: reload mid-transfer resumes; verified files come back from OPFS", { timeout: 300_000 }, async () => {
     const W = makeDir(join(TMP, "reload"));
     await makeRandom(join(W, "small.bin"), 3e6); // verifies before the reload → done-marker path

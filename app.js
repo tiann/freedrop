@@ -377,6 +377,19 @@ const cleanRanges = (raw, max) => {
 // slots keeps one intact record at all times; a torn write loses at
 // most half a second of ranges.
 const savedSeq = new Map(); // id -> seq of the journal chosen at init
+// Navigation can release the page's Web Lock before Chromium finishes
+// closing its worker's OPFS handles. Wait for that cleanup while keeping
+// exclusive access; a live owner must still cause a bounded failure.
+const openAccess = async (handle) => {
+    const deadline = Date.now() + 5000;
+    for (;;) {
+        try { return await handle.createSyncAccessHandle(); }
+        catch (err) {
+            if (err.name !== "NoModificationAllowedError" || Date.now() >= deadline) throw err;
+            await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+    }
+};
 const writeJournal = (f, obj) => { // throws: callers decide what a failure means
     // The sequence is a commit index, not an attempt counter. If write,
     // truncate, or flush fails, retry the same inactive slot so the last
@@ -448,7 +461,7 @@ async function init(rid) {
     }
     dir = await top.getDirectoryHandle(rid, { create: true });
     // claim this stage: the open meta handle doubles as a liveness lock
-    metaAccess = await (await dir.getFileHandle("meta", { create: true })).createSyncAccessHandle();
+    metaAccess = await openAccess(await dir.getFileHandle("meta", { create: true }));
     writeMeta();
     // journals from an interrupted visit of this same link
     const entries = [];
@@ -552,7 +565,7 @@ onmessage = async (e) => {
                 files.set(m.id, f);
                 f.ready = (async () => {
                     f.handle = await dir.getFileHandle("f" + m.id);
-                    f.access = await f.handle.createSyncAccessHandle();
+                    f.access = await openAccess(f.handle);
                 })();
                 await f.ready;
                 return;
@@ -567,12 +580,12 @@ onmessage = async (e) => {
             files.set(m.id, f);
             f.ready = (async () => {
                 f.handle = await dir.getFileHandle("f" + m.id, { create: true });
-                f.access = await f.handle.createSyncAccessHandle();
+                f.access = await openAccess(f.handle);
                 if (m.fresh) f.access.truncate(0); // drop bytes from any older stage
                 f.access.truncate(m.size);
                 f.slots = [
-                    await (await dir.getFileHandle("f" + m.id + ".json", { create: true })).createSyncAccessHandle(),
-                    await (await dir.getFileHandle("f" + m.id + ".json.b", { create: true })).createSyncAccessHandle(),
+                    await openAccess(await dir.getFileHandle("f" + m.id + ".json", { create: true })),
+                    await openAccess(await dir.getFileHandle("f" + m.id + ".json.b", { create: true })),
                 ];
                 await checkDone(m.id, f); // 0-byte files need no chunks
             })();
@@ -598,7 +611,7 @@ onmessage = async (e) => {
             try { metaAccess.close(); } catch {}
         }
     } catch (err) {
-        postMessage({ op: "error", message: String((err && err.message) || err) });
+        postMessage({ op: "error", name: err && err.name, message: String((err && err.message) || err) });
     }
 };
 `;
@@ -1064,8 +1077,11 @@ async function receive(codeStr) {
     }
     const worker = new Worker(URL.createObjectURL(new Blob([WORKER_SRC], { type: "text/javascript" })));
     const saved = await new Promise((resolve, reject) => {
-        worker.onmessage = (e) => (e.data.op === "state" ? resolve(e.data.entries) : reject(new Error(T.tooOld)));
-        worker.onerror = () => reject(new Error(T.tooOld));
+        worker.onmessage = ({ data }) => {
+            if (data.op === "state") resolve(data.entries);
+            else reject(new Error(data.name === "NoModificationAllowedError" ? T.busyTab : data.message || T.tooOld));
+        };
+        worker.onerror = (e) => reject(new Error(e.message || T.tooOld));
         worker.postMessage({ op: "init", rid });
     });
 
@@ -1179,7 +1195,7 @@ async function receive(codeStr) {
         const m = e.data;
         if (m.op === "file") onFileReady(m.id, m.file);
         else if (m.op === "badhash") fail(T.badhash(m.name));
-        else if (m.op === "error") fail(m.message);
+        else if (m.op === "error") fail(m.name === "NoModificationAllowedError" ? T.busyTab : m.message);
     };
     worker.onerror = (e) => fail(String(e.message ?? e));
 
