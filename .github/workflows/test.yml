@@ -8,6 +8,8 @@ on:
 # Both jobs run hermetically: signaling goes through a local mosquitto
 # (ws:// MQTT) instead of the public brokers, and the data path is
 # WebRTC over loopback — no external network in the loop.
+# Ubuntu's AppArmor profile permits broker configs under /etc/mosquitto.
+# Use the distro service so config and runtime paths respect that policy.
 
 jobs:
   cli:
@@ -23,9 +25,8 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq mosquitto
-          sudo systemctl stop mosquitto || true
-          printf 'listener 9001 127.0.0.1\nprotocol websockets\nallow_anonymous true\n' > /tmp/mosquitto.conf
-          mosquitto -c /tmp/mosquitto.conf -d
+          printf 'listener 9001 127.0.0.1\nprotocol websockets\nallow_anonymous true\n' | sudo tee /etc/mosquitto/conf.d/freedrop-ci.conf > /dev/null
+          sudo systemctl restart mosquitto
       - run: npm ci
       - run: npm test
         env:
@@ -44,9 +45,8 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq mosquitto
-          sudo systemctl stop mosquitto || true
-          printf 'listener 9001 127.0.0.1\nprotocol websockets\nallow_anonymous true\n' > /tmp/mosquitto.conf
-          mosquitto -c /tmp/mosquitto.conf -d
+          printf 'listener 9001 127.0.0.1\nprotocol websockets\nallow_anonymous true\n' | sudo tee /etc/mosquitto/conf.d/freedrop-ci.conf > /dev/null
+          sudo systemctl restart mosquitto
       - run: npm ci
       - run: npx playwright install --with-deps chromium
       - run: npm run test:browser
