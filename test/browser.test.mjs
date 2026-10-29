@@ -208,6 +208,83 @@ test("browser: an absent sender stops retries after the connection window", { ti
     assert.equal(await page.evaluate(() => window.signalRace.hellos.length), hellos, "terminal failure must stop retrying");
 });
 
+// A recording stand-in for the Screen Wake Lock API, with the system's
+// side of it: hiding the tab releases every lock.
+const fakeWakeLock = (page) => page.addInitScript(() => {
+    let visible = true;
+    const held = new Set();
+    window.wake = { requests: 0, held: () => held.size };
+    Object.defineProperty(document, "visibilityState", { get: () => (visible ? "visible" : "hidden") });
+    window.setVisible = (v) => {
+        visible = v;
+        if (!v) for (const lock of [...held]) lock.release();
+        document.dispatchEvent(new Event("visibilitychange"));
+    };
+    Object.defineProperty(navigator, "wakeLock", {
+        value: {
+            request: async () => {
+                const lock = new EventTarget();
+                lock.release = async () => {
+                    if (!held.delete(lock)) return;
+                    lock.dispatchEvent(new Event("release"));
+                };
+                held.add(lock);
+                window.wake.requests++;
+                return lock;
+            },
+        },
+    });
+});
+const wakeHeld = (page) => page.evaluate(() => window.wake.held());
+
+test("CLI → browser: the screen stays on while receiving, and again after the tab returns", { timeout: 90_000 }, async (t) => {
+    const W = makeDir(join(TMP, "wake-recv"));
+    await makeRandom(join(W, "aaa.bin"), 20e6);
+    const sender = startCli(["--no-qr", join(W, "aaa.bin")], { FREEDROP_BPS: "4000000" });
+    t.after(() => sender.kill("SIGKILL"));
+    const code = await transferCode(sender);
+    const page = await newPage("wake-recv");
+    t.after(() => page.context().close());
+    await fakeWakeLock(page);
+    const got = collectDownloads(page);
+    await page.goto(`${BASE}/#${code}`);
+    const save = page.getByRole("button", { name: /Save|保存/ });
+    await save.waitFor({ timeout: 15_000 });
+    assert.equal(await wakeHeld(page), 0, "deciding at the Save button needs no lock");
+    await save.click();
+    await waitFor(async () => await wakeHeld(page) === 1, 10_000, "lock while receiving");
+    await page.evaluate(() => window.setVisible(false));
+    assert.equal(await wakeHeld(page), 0);
+    await page.evaluate(() => window.setVisible(true));
+    await waitFor(async () => await wakeHeld(page) === 1, 5_000, "lock taken again after the tab returns");
+    await pageDone(page);
+    await waitFor(async () => await wakeHeld(page) === 0, 5_000, "lock released when done");
+    assert.equal(await page.evaluate(() => window.wake.requests), 2);
+    const hashes = await saveDownloads(page, got, ["aaa.bin"]);
+    assert.equal(hashes["aaa.bin"], await sha256(join(W, "aaa.bin")));
+    assert.equal(await exited(sender), 0, sender.out);
+});
+
+test("browser → CLI: the sender keeps the screen on from the link until done", { timeout: 90_000 }, async (t) => {
+    const W = makeDir(join(TMP, "wake-send"));
+    const dst = makeDir(join(W, "dst"));
+    await makeRandom(join(W, "aaa.bin"), 1024);
+    const page = await newPage("wake-send");
+    t.after(() => page.context().close());
+    await fakeWakeLock(page);
+    await page.goto(`${BASE}/`);
+    assert.equal(await wakeHeld(page), 0, "an idle drop zone needs no lock");
+    await page.setInputFiles("#picker", [join(W, "aaa.bin")]);
+    const code = await waitFor(() => page.locator("#link").textContent()
+        .then((s) => s.match(/npx freedrop ([A-Za-z0-9_-]{40,48})/)?.[1]), 30_000, "browser code");
+    assert.equal(await wakeHeld(page), 1, "waiting for the receiver needs the screen on");
+    const recv = startCli(["-y", "-o", dst, code]);
+    assert.equal(await exited(recv), 0, recv.out);
+    await pageDone(page);
+    assert.equal(await wakeHeld(page), 0, "lock released when done");
+    assert.equal(await sha256(join(dst, "aaa.bin")), await sha256(join(W, "aaa.bin")));
+});
+
 test("CLI → browser: striped big + small + empty", { timeout: 300_000 }, async () => {
     const W = makeDir(join(TMP, "c2b"));
     await makeRandom(join(W, "big.bin"), 100e6);

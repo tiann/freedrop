@@ -19,7 +19,7 @@ Every combination works:
 | | receiver: CLI | receiver: browser |
 |---|---|---|
 | **sender: CLI** | `npx freedrop <code>` | open the link / scan the QR |
-| **sender: browser** | `npx freedrop <code>` | open the link |
+| **sender: browser** | `npx freedrop <code>` | open the link / scan the QR |
 
 The web client is a static page (this repo, deployed to
 [freedrop.dev](https://freedrop.dev/)) — host it anywhere, or open it
@@ -150,9 +150,11 @@ corrupting the file.
 ## Tests
 
 `npm test` runs the CLI↔CLI end-to-end suite: real WebRTC over
-loopback, SIGKILL-driven resume scenarios, sha256 over every byte.
-`npm run test:browser` adds the browser paths (all three interop
-directions, reload-resume, resume under a browser sender) via Playwright
+loopback, SIGKILL-driven resume scenarios, sha256 over every byte —
+plus the web page's QR encoder (`qr.mjs`), checked module for module
+against the CLI's. `npm run test:browser` adds the browser paths (all
+three interop directions, reload-resume, resume under a browser sender,
+the screen wake lock) via Playwright
 — run `npx playwright install chromium` once first. Signaling uses the
 public brokers by default; point `FREEDROP_TEST_BROKER` at a local
 `ws://` MQTT broker for a hermetic run — CI does exactly that with

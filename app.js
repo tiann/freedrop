@@ -13,6 +13,7 @@
 // instead of restarting. Every file is verified against the sender's
 // hash (sha256 over 4 MiB block sha256s) before it becomes a download.
 import { SignalRoom, IceInbox, b64u } from "./signal.mjs";
+import { qrSvg } from "./qr.mjs";
 
 const STUN = [
     { urls: "stun:stun.cloudflare.com:3478" },
@@ -29,22 +30,40 @@ const CONNECT_WINDOW = 15_000;
 const RETRY_WINDOW = 90_000;
 
 const zh = (navigator.language || "").toLowerCase().startsWith("zh");
+const touch = matchMedia("(pointer: coarse)").matches;
 const T = zh ? {
-    drop: "拖文件到这里，或点击选择",
-    share: "把链接发给对方，或让对方运行:",
-    waiting: "等待对方连接…",
+    tagline: "点对点传文件，不经过任何服务器",
+    dropTitle: touch ? "选择要发送的文件" : "拖文件到这里",
+    dropHint: touch ? "点按从设备中选取" : "或点击选择文件",
+    trust: "端到端加密 · 文件不上传",
+    files: (n, s) => `${n} 个文件 · ${s}`,
+    shareLink: "把链接发给对方",
+    shareOrScan: "把链接发给对方，或用手机扫码",
+    qrLabel: "链接的二维码",
+    orCli: "或在终端接收",
+    copy: "复制",
+    copied: "已复制",
+    share: "分享",
+    waiting: "等待对方打开链接…",
+    keepOpen: "传完之前请保持此页面打开",
     connecting: "连接中…",
     reconnecting: "连接中断，重连中…",
-    incoming: (n, s) => `收到 ${n} 个文件 (${s})`,
-    resuming: (s) => `继续上次的传输 — 已有 ${s}`,
-    save: "保存",
-    copy: "复制链接",
-    copied: "已复制",
-    sending: (s) => `发送中 ${s}`,
-    receiving: (s) => `接收中 ${s}`,
+    resuming: (s) => `继续上次的传输，已有 ${s}`,
+    save: (n) => (n > 1 ? `保存 ${n} 个文件` : "保存"),
+    sending: "发送中",
+    receiving: "接收中",
     verifying: "校验中…",
-    doneSend: (s, t) => `✓ 已发送 ${s}，用时 ${t}s（对方已校验）`,
-    doneRecv: (s, t) => `✓ 已接收 ${s}，用时 ${t}s（已校验）`,
+    of: (a, b) => `${a} / ${b}`,
+    left: (t) => `剩余 ${t}`,
+    dur: (s) => s < 60 ? `${Math.ceil(s)} 秒`
+        : s < 3600 ? `${Math.round(s / 60)} 分钟`
+        : `${Math.floor(s / 3600)} 小时 ${Math.round((s % 3600) / 60)} 分`,
+    doneSend: (s, t) => `已发送 ${s}，用时 ${t} · 对方已校验`,
+    doneRecv: (s, t) => `已接收 ${s}，用时 ${t} · 已校验`,
+    savedHint: "已存到下载目录，点文件名可再次保存",
+    sendMore: "继续发送",
+    startOver: "重新开始",
+    retry: "重试",
     noSender: "找不到发送方 — 确认对方的 freedrop 还开着",
     p2pFail: "P2P 连接失败 — 检查网络；若双方都在对称 NAT/CGNAT 后，可在发送方加 --turn",
     savedReload: "连接中断 — 进度已保存，重新打开此链接可续传",
@@ -56,31 +75,48 @@ const T = zh ? {
     noRtc: "此浏览器不支持 WebRTC",
     brokerFail: "连不上任何会合节点 — 检查网络",
 } : {
-    drop: "Drop files here, or tap to choose",
-    share: "Send the link, or have them run:",
-    waiting: "waiting for the other side…",
-    connecting: "connecting…",
-    reconnecting: "connection lost — reconnecting…",
-    incoming: (n, s) => `incoming: ${n} file(s) (${s})`,
-    resuming: (s) => `resuming — ${s} already here`,
-    save: "Save",
-    copy: "Copy link",
+    tagline: "Peer-to-peer file transfer, no server in between",
+    dropTitle: touch ? "Choose files to send" : "Drop files here",
+    dropHint: touch ? "Tap to pick from your device" : "or click to browse",
+    trust: "End-to-end encrypted · nothing is uploaded",
+    files: (n, s) => `${n} file${n === 1 ? "" : "s"} · ${s}`,
+    shareLink: "Share this link",
+    shareOrScan: "Share this link, or scan it with a phone",
+    qrLabel: "QR code of the link",
+    orCli: "Or receive in a terminal",
+    copy: "Copy",
     copied: "Copied",
-    sending: (s) => `sending ${s}`,
-    receiving: (s) => `receiving ${s}`,
-    verifying: "verifying…",
-    doneSend: (s, t) => `✓ sent ${s} in ${t}s — verified by the receiver`,
-    doneRecv: (s, t) => `✓ received ${s} in ${t}s — verified`,
-    noSender: "no sender found — is their freedrop still running?",
+    share: "Share",
+    waiting: "Waiting for the receiver…",
+    keepOpen: "Keep this tab open until the transfer finishes.",
+    connecting: "Connecting…",
+    reconnecting: "Connection lost — reconnecting…",
+    resuming: (s) => `Resuming — ${s} already here`,
+    save: (n) => (n > 1 ? `Save ${n} files` : "Save"),
+    sending: "Sending",
+    receiving: "Receiving",
+    verifying: "Verifying…",
+    of: (a, b) => `${a} of ${b}`,
+    left: (t) => `${t} left`,
+    dur: (s) => s < 60 ? `${Math.ceil(s)} s`
+        : s < 3600 ? `${Math.round(s / 60)} min`
+        : `${Math.floor(s / 3600)} h ${Math.round((s % 3600) / 60)} min`,
+    doneSend: (s, t) => `Sent ${s} in ${t} — verified by the receiver`,
+    doneRecv: (s, t) => `Received ${s} in ${t} — verified`,
+    savedHint: "Saved to your downloads — click a file to save it again.",
+    sendMore: "Send more files",
+    startOver: "Start over",
+    retry: "Try again",
+    noSender: "No sender found — is their freedrop still running?",
     p2pFail: "P2P failed — check the network; for symmetric NAT/CGNAT on both ends, try --turn on the sender",
-    savedReload: "connection lost — progress is saved; reopen this link to resume",
-    declined: "the other side declined",
-    busyTab: "this link is already being received in another tab — use that one",
-    badhash: (n) => `${n}: verification failed — did the sender's file change? transfer it again`,
-    tooOld: "this browser is too old (no OPFS staging support)",
-    noSpace: (s) => `not enough browser storage (need ${s})`,
-    noRtc: "this browser does not support WebRTC",
-    brokerFail: "cannot reach any rendezvous broker — check the network",
+    savedReload: "Connection lost — progress is saved; reopen this link to resume",
+    declined: "The other side declined",
+    busyTab: "This link is already being received in another tab — use that one",
+    badhash: (n) => `${n}: verification failed — did the sender's file change? Transfer it again`,
+    tooOld: "This browser is too old (no OPFS staging support)",
+    noSpace: (s) => `Not enough browser storage (need ${s})`,
+    noRtc: "This browser does not support WebRTC",
+    brokerFail: "Cannot reach any rendezvous broker — check the network",
 };
 
 const $ = (id) => document.getElementById(id);
@@ -92,29 +128,132 @@ const fmtSize = (n) =>
     : n >= 1 << 20 ? `${(n / (1 << 20)).toFixed(1)} MB`
     : n >= 1024 ? `${(n / 1024).toFixed(0)} KB`
     : `${n} B`;
+const fmtElapsed = (ms) => (ms < 60_000 ? `${(ms / 1000).toFixed(1)} s` : T.dur(ms / 1000));
 
 const hex = (buf) =>
     [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
 
-const status = (text, error = false) => {
-    $("status").textContent = text;
-    $("status").className = error ? "error" : "";
+const ICON = {
+    file: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>`,
+    check: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>`,
+    copy: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2.5"/><path d="M5 15H4.5A1.5 1.5 0 0 1 3 13.5v-9A1.5 1.5 0 0 1 4.5 3h9A1.5 1.5 0 0 1 15 4.5V5"/></svg>`,
+    share: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 15V3m-4 4l4-4 4 4"/><path d="M5 12v7a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-7"/></svg>`,
 };
-const bar = (frac) => {
-    $("bar").style.display = "block";
-    $("bar").firstElementChild.style.width = `${Math.floor(frac * 100)}%`;
+
+// The card is one column of optional blocks; each helper owns a block
+// and shows it only while it has something to say.
+const hint = (text = "") => {
+    $("hint").textContent = text;
+    $("hint").hidden = !text;
 };
-const listFiles = (files) => {
-    $("files").innerHTML = "";
-    for (const f of files) {
-        const div = document.createElement("div");
-        div.className = "file";
-        div.innerHTML = `<span></span><span class="size"></span>`;
-        div.firstElementChild.textContent = f.name;
-        div.lastElementChild.textContent = fmtSize(f.size);
-        $("files").appendChild(div);
+let retryLabel = null; // what reloading the page means in this mode
+let retryBtn = null;
+const BADGE = { busy: "", done: "✓", error: "!" };
+const status = (text, state = "") => {
+    $("status").className = state;
+    $("status").replaceChildren();
+    if (state in BADGE) $("status").append(Object.assign(document.createElement("i"), { textContent: BADGE[state] }));
+    if (text) $("status").append(text);
+    $("pct").textContent = "";
+    $("meta").hidden = true;
+    $("progress").hidden = !text && $("bar").hidden;
+    document.title = state === "done" ? "✓ freedrop" : "freedrop";
+    if (state !== "error" && retryBtn) {
+        retryBtn.remove();
+        retryBtn = null;
+        $("actions").hidden = !$("actions").children.length;
     }
 };
+const bar = (frac) => {
+    $("bar").hidden = false;
+    $("progress").hidden = false;
+    $("bar").firstElementChild.style.width = `${Math.floor(frac * 100)}%`;
+};
+const action = (label, onclick, className = "") => {
+    const b = Object.assign(document.createElement("button"), { textContent: label, className, onclick });
+    $("actions").append(b);
+    $("actions").hidden = false;
+    return b;
+};
+const clearActions = () => {
+    $("actions").replaceChildren();
+    $("actions").hidden = true;
+    retryBtn = null;
+};
+
+// throughput over a sliding window — whole-transfer averages lie after
+// a stall or a resume; a shrinking count is a new attempt, start over
+const samples = [];
+const rate = (bytes) => {
+    const now = performance.now();
+    if (samples.length && bytes < samples.at(-1)[1]) samples.length = 0;
+    samples.push([now, bytes]);
+    while (samples.length > 2 && now - samples[0][0] > 4000) samples.shift();
+    const secs = (now - samples[0][0]) / 1000;
+    return secs >= 1 ? (bytes - samples[0][1]) / secs : 0;
+};
+const progress = (verb, done, total) => {
+    const pct = `${Math.floor((total ? done / total : 1) * 100)}%`;
+    status(verb);
+    bar(total ? done / total : 1);
+    $("pct").textContent = pct;
+    $("meta").hidden = false;
+    $("amount").textContent = T.of(fmtSize(done), fmtSize(total));
+    const r = rate(done);
+    $("rate").textContent = r <= 0 ? ""
+        : done < total ? `${fmtSize(r)}/s · ${T.left(T.dur((total - done) / r))}`
+        : `${fmtSize(r)}/s`;
+    document.title = `${pct} · freedrop`;
+};
+const showDone = (text) => {
+    $("card").classList.add("done");
+    bar(1);
+    status(text, "done");
+};
+
+const listFiles = (files) => {
+    $("count").textContent = T.files(files.length, fmtSize(files.reduce((n, f) => n + f.size, 0)));
+    $("summary").hidden = false;
+    $("files").hidden = false;
+    $("files").replaceChildren();
+    for (const f of files) {
+        const li = document.createElement("li");
+        li.className = "file";
+        li.innerHTML = `<span class="tile"></span><span class="name"></span><span class="size"></span>`;
+        const [tile, name, size] = li.children;
+        const ext = /\.([a-z0-9]{1,4})$/i.exec(f.name)?.[1];
+        if (ext) tile.textContent = ext.toUpperCase();
+        else tile.innerHTML = ICON.file;
+        name.textContent = f.name;
+        name.title = f.name;
+        size.textContent = fmtSize(f.size);
+        $("files").appendChild(li);
+    }
+};
+const markDone = (row) => {
+    row.classList.add("done");
+    row.querySelector(".tile").innerHTML = ICON.check;
+};
+
+// a phone that turns its screen off suspends the tab, and a suspended tab
+// drops its peer connections — hold the screen on while a transfer needs
+// it. The system lets go whenever the tab is hidden: ask again on return.
+let wakeWanted = false;
+let wake = null; // Promise<WakeLockSentinel | null>, held or pending
+const keepAwake = (on) => {
+    wakeWanted = on;
+    if (!on) {
+        wake?.then((lock) => lock?.release());
+        return;
+    }
+    if (wake || document.visibilityState !== "visible" || !navigator.wakeLock) return;
+    wake = navigator.wakeLock.request("screen").then((lock) => {
+        lock.addEventListener("release", () => { wake = null; });
+        if (!wakeWanted) lock.release();
+        return lock;
+    }, () => (wake = null));
+};
+document.addEventListener("visibilitychange", () => keepAwake(wakeWanted));
 
 // tag 1 = JSON control; tag 0 = file bytes + 8-byte transfer-global
 // offset, which lets each chunk land positionally from any stripe and
@@ -182,7 +321,19 @@ const cleanRanges = (raw, max) => {
     return rs;
 };
 
-const fatal = (text) => status(text, true);
+// every error offers the way out a reload gives in this mode: a receiver
+// resumes from its journal, a sender gets back to the drop zone
+const fatal = (text) => {
+    status(text, "error");
+    hint();
+    $("trust").hidden = true;
+    if (retryLabel && !retryBtn) {
+        retryBtn = action(retryLabel, () => {
+            onbeforeunload = null;
+            location.reload();
+        }, "ghost");
+    }
+};
 const ABORT = Symbol("attempt aborted");
 
 // The receiver's OPFS staging worker. It owns every byte: positional
@@ -454,6 +605,13 @@ onmessage = async (e) => {
 
 // ---------------------------------------------------------------------------
 
+$("tagline").textContent = T.tagline;
+$("trust-text").textContent = T.trust;
+// a file dropped anywhere outside the drop zone would otherwise replace
+// the page — and with it a running transfer
+addEventListener("dragover", (e) => e.preventDefault());
+addEventListener("drop", (e) => e.preventDefault());
+
 const code = decodeURIComponent(location.hash.slice(1).replace(/^k=/, ""));
 if (typeof RTCPeerConnection === "undefined") {
     fatal(T.noRtc);
@@ -472,20 +630,34 @@ if (typeof RTCPeerConnection === "undefined") {
 
 function sendMode() {
     $("drop").hidden = false;
-    $("drop-label").textContent = T.drop;
+    $("drop-title").textContent = T.dropTitle;
+    $("drop-hint").textContent = T.dropHint;
     $("drop").onclick = () => $("picker").click();
-    $("drop").ondragover = (e) => { e.preventDefault(); $("drop").classList.add("hover"); };
-    $("drop").ondragleave = () => $("drop").classList.remove("hover");
-    $("drop").ondrop = (e) => {
-        e.preventDefault();
-        start([...e.dataTransfer.files]);
+    // the whole window is the drop target; a depth count survives the
+    // enter/leave pairs every child element fires
+    let depth = 0;
+    const hover = (d) => {
+        depth = Math.max(0, d);
+        $("drop").classList.toggle("hover", depth > 0 && !$("drop").hidden);
     };
-    $("picker").onchange = () => start([...$("picker").files]);
+    ondragenter = (e) => { if (e.dataTransfer?.types.includes("Files")) hover(depth + 1); };
+    ondragleave = () => hover(depth - 1);
+    const go = (files) => start(files).catch((e) => fatal(String(e.message ?? e)));
+    ondrop = (e) => {
+        hover(0);
+        if (!$("drop").hidden) go([...(e.dataTransfer?.files ?? [])]);
+    };
+    $("picker").onchange = () => go([...$("picker").files]);
 
     async function start(files) {
         if (!files.length) return;
         $("drop").hidden = true;
+        $("trust").hidden = true;
         listFiles(files);
+        status(T.connecting, "busy");
+        retryLabel = T.startOver;
+        // the picked files die with the page — confirm before leaving
+        onbeforeunload = (e) => e.preventDefault();
         const total = files.reduce((n, f) => n + f.size, 0);
         const bases = [];
         {
@@ -502,25 +674,66 @@ function sendMode() {
             .catch(() => { throw new Error(T.brokerFail); });
 
         const link = `${location.origin}${location.pathname}#${codeStr}`;
-        $("link").hidden = false;
-        $("link").textContent = `${link}\n\n${T.share}  npx freedrop ${codeStr}`;
-        $("actions").hidden = false;
-        const copyBtn = document.createElement("button");
-        copyBtn.textContent = T.copy;
-        copyBtn.onclick = () => {
-            navigator.clipboard?.writeText(link);
-            copyBtn.textContent = T.copied;
-            setTimeout(() => (copyBtn.textContent = T.copy), 1500);
+        const cmd = `npx freedrop ${codeStr}`;
+        // the CLI row's copy button stays text-free: tests (and people)
+        // read the code straight out of #link's text
+        $("link").innerHTML = `<div class="label"></div>
+            <div class="share"><div class="qr" role="img"></div><div class="links">
+                <div class="field"><span class="val"></span></div>
+                <div class="label cli"></div>
+                <div class="field cmd"><code class="val"></code></div>
+            </div></div>`;
+        const [linkLabel, share] = $("link").children;
+        const [qrBox, links] = share.children;
+        const [linkField, cliLabel, cliField] = links.children;
+        // phone cameras open the link straight from the screen; a link too
+        // long for the encoder just goes without
+        const svg = qrSvg(link);
+        if (svg) {
+            qrBox.innerHTML = svg;
+            qrBox.setAttribute("aria-label", T.qrLabel);
+        } else qrBox.remove();
+        linkLabel.textContent = svg ? T.shareOrScan : T.shareLink;
+        linkField.firstElementChild.textContent = link.replace(/^https?:\/\//, "");
+        cliLabel.textContent = T.orCli;
+        cliField.firstElementChild.textContent = cmd;
+        const copyButton = (field, text, label) => {
+            const b = document.createElement("button");
+            const idle = `${ICON.copy}${label ? `<span>${label}</span>` : ""}`;
+            b.className = label ? "" : "icon";
+            b.innerHTML = idle;
+            b.setAttribute("aria-label", T.copy);
+            b.onclick = async () => {
+                try {
+                    await navigator.clipboard.writeText(text);
+                } catch { // no clipboard (insecure origin): select it instead
+                    getSelection().selectAllChildren(field.firstElementChild);
+                    return;
+                }
+                b.innerHTML = `${ICON.check}${label ? `<span>${T.copied}</span>` : ""}`;
+                setTimeout(() => (b.innerHTML = idle), 1500);
+            };
+            field.append(b);
         };
-        $("actions").appendChild(copyBtn);
+        copyButton(linkField, link, T.copy);
         if (navigator.share) {
-            const shareBtn = document.createElement("button");
-            shareBtn.className = "ghost";
-            shareBtn.textContent = "Share";
-            shareBtn.onclick = () => navigator.share({ url: link }).catch(() => {});
-            $("actions").appendChild(shareBtn);
+            const b = document.createElement("button");
+            b.className = "ghost";
+            b.innerHTML = `${ICON.share}<span></span>`;
+            b.lastElementChild.textContent = T.share;
+            b.onclick = () => navigator.share({ url: link }).catch(() => {});
+            linkField.append(b);
         }
-        status(T.waiting);
+        copyButton(cliField, cmd);
+        // the link matters until a receiver is in; once the transfer
+        // runs (or is done and the room closed) it is just noise
+        const waiting = () => {
+            status(T.waiting, "busy");
+            $("link").hidden = false;
+        };
+        waiting();
+        hint(T.keepOpen);
+        keepAwake(true);
 
         let at = null; // current attempt
         let acceptedEver = false;
@@ -533,8 +746,7 @@ function sendMode() {
             const now = Date.now();
             if (now - lastDraw < 100 && sent !== need) return;
             lastDraw = now;
-            status(T.sending(`${fmtSize(sent)} / ${fmtSize(need)}`));
-            bar(need ? sent / need : 1);
+            progress(T.sending, sent, need);
         };
 
         // 64 KiB messages measured fastest for the native CLI end and are
@@ -556,7 +768,7 @@ function sendMode() {
 
         const lost = (a) => {
             teardown(a);
-            if (at === a && !done) status(T.waiting);
+            if (at === a && !done) waiting();
         };
 
         const sendCtl = (a, obj) => {
@@ -670,7 +882,7 @@ function sendMode() {
                 sendCtl(a, { t: "hash", i: fi, sha: hex(await crypto.subtle.digest("SHA-256", cat)) });
             }
             sendCtl(a, { t: "eof" });
-            status(T.verifying);
+            status(T.verifying, "busy");
         };
 
         const fileIndexAt = (off) => {
@@ -733,7 +945,7 @@ function sendMode() {
             const maxConns = Math.min(connsWanted ?? 1, STRIPE_CONNS);
             const a = { sid, conns: [], ice: new IceInbox(), dead: false, streaming: false, drainResolve: null };
             at = a;
-            status(T.connecting);
+            status(T.connecting, "busy");
             const pc = new RTCPeerConnection({ iceServers: STUN });
             const c0 = { pc, dc: null, used: true };
             a.conns[0] = c0;
@@ -764,21 +976,26 @@ function sendMode() {
                     if (a.streaming) return; // duplicate accept must not restart
                     a.streaming = true;
                     acceptedEver = true;
+                    $("link").hidden = true;
                     streamAll(a, m.have).catch((e) => {
-                        if (e === ABORT) { if (at === a && !done) status(T.waiting); }
+                        if (e === ABORT) { if (at === a && !done) waiting(); }
                         else fatal(String(e.message ?? e));
                     });
                 } else if (m.t === "more") {
                     streamMore(a, m.have).catch((e) => {
-                        if (e === ABORT) { if (at === a && !done) status(T.waiting); }
+                        if (e === ABORT) { if (at === a && !done) waiting(); }
                         else fatal(String(e.message ?? e));
                     });
                 } else if (m.t === "reject") {
                     fatal(T.declined);
                 } else if (m.t === "done") {
                     done = true;
-                    bar(1);
-                    status(T.doneSend(fmtSize(total), ((Date.now() - t0) / 1000).toFixed(1)));
+                    onbeforeunload = null;
+                    keepAwake(false);
+                    showDone(T.doneSend(fmtSize(total), fmtElapsed(Date.now() - t0)));
+                    hint();
+                    for (const row of $("files").children) markDone(row);
+                    action(T.sendMore, () => location.reload());
                     setTimeout(() => {
                         teardown(a);
                         room.close();
@@ -829,7 +1046,8 @@ function sendMode() {
 
 async function receive(codeStr) {
     const startedAt = Date.now();
-    status(T.connecting);
+    retryLabel = T.retry;
+    status(T.connecting, "busy");
     if (!navigator.storage?.getDirectory) throw new Error(T.tooOld);
     const rid = hex(await crypto.subtle.digest("SHA-256", enc.encode(`freedrop-stage:${codeStr}`))).slice(0, 20);
     // two tabs on the same link would share the OPFS stage and corrupt
@@ -878,6 +1096,7 @@ async function receive(codeStr) {
     const timers = [];
 
     const stop = () => {
+        keepAwake(false);
         for (const t of timers) clearInterval(t);
         teardownAttempt();
         room.close();
@@ -888,8 +1107,7 @@ async function receive(codeStr) {
         const now = Date.now();
         if (now - lastDraw < 100 && coveredTotal !== total) return;
         lastDraw = now;
-        status(T.receiving(`${fmtSize(coveredTotal)} / ${fmtSize(total)}`));
-        bar(total ? coveredTotal / total : 1);
+        progress(T.receiving, coveredTotal, total);
     };
 
     const sendCtl = (obj) => {
@@ -918,8 +1136,8 @@ async function receive(codeStr) {
         finished = true;
         worker.postMessage({ op: "complete" }); // mark the stage sweepable
         sendCtl({ t: "done" });
-        bar(1);
-        status(T.doneRecv(fmtSize(total), ((Date.now() - t0) / 1000).toFixed(1)));
+        showDone(T.doneRecv(fmtSize(total), fmtElapsed(Date.now() - t0)));
+        hint(T.savedHint);
         setTimeout(stop, 500);
     };
 
@@ -938,8 +1156,9 @@ async function receive(codeStr) {
             const a = document.createElement("a");
             a.href = url;
             a.download = name;
-            a.textContent = name;
-            row.firstElementChild.replaceChildren(a);
+            a.textContent = f.name;
+            row.querySelector(".name").replaceChildren(a);
+            markDone(row);
         }
         const a = document.createElement("a");
         a.href = url;
@@ -987,6 +1206,8 @@ async function receive(codeStr) {
 
     const acceptNow = () => {
         acceptedEver = true;
+        $("trust").hidden = true;
+        keepAwake(true);
         if (!t0) t0 = Date.now();
         if (!staged) {
             staged = true;
@@ -1031,24 +1252,21 @@ async function receive(codeStr) {
             return entry;
         });
         listFiles(manifest);
-        status(T.incoming(manifest.length, fmtSize(total)));
+        status("");
+        hint();
         if (coveredTotal > 0) {
             // this link was accepted once already — pick up where it stopped
-            status(T.resuming(fmtSize(coveredTotal)));
+            status(T.resuming(fmtSize(coveredTotal)), "busy");
             return acceptNow();
         }
-        $("actions").hidden = false;
-        const btn = document.createElement("button");
-        btn.textContent = T.save;
-        btn.onclick = async () => {
-            btn.disabled = true;
+        action(T.save(manifest.length), async () => {
+            clearActions();
             try { // staging needs quota headroom for the whole transfer
                 const { quota = Infinity, usage = 0 } = await navigator.storage.estimate();
                 if (total > quota - usage) return fatal(T.noSpace(fmtSize(total)));
             } catch {}
             acceptNow();
-        };
-        $("actions").appendChild(btn);
+        });
     };
 
     // eof races the stripes: it rides connection 0 while other stripes
@@ -1115,7 +1333,7 @@ async function receive(codeStr) {
         const now = Date.now();
         if (!manifest) {
             if (now - startedAt >= CONNECT_WINDOW) return fail(senderFound ? T.p2pFail : T.noSender);
-            status(T.reconnecting);
+            status(T.reconnecting, "busy");
             startAttempt();
             return;
         }
@@ -1124,7 +1342,7 @@ async function receive(codeStr) {
             stop();
             return fatal(T.savedReload); // the journal survives — reopening resumes
         }
-        status(T.reconnecting);
+        status(T.reconnecting, "busy");
         lastData = now; // fresh grace period for the new attempt
         startAttempt();
     };
@@ -1139,7 +1357,7 @@ async function receive(codeStr) {
             a.gotOffer = true;
             if (k === 0) {
                 senderFound = true;
-                if (!manifest) status(T.connecting);
+                if (!manifest) status(T.connecting, "busy");
             }
             const pc = new RTCPeerConnection({ iceServers: [...STUN, ...(msg.ice ?? [])] });
             const c = { pc, ch: null, rx: false, last: -1 };
@@ -1205,7 +1423,7 @@ async function receive(codeStr) {
         if (!acceptedEver) return; // waiting at the Save button is not a stall
         const allShaKnown = vfiles.every((f) => f.done || f.sha);
         if (coveredTotal === total && allShaKnown) {
-            status(T.verifying);
+            status(T.verifying, "busy");
             return;
         }
         const grace = coveredTotal === total ? 30_000 : 20_000;

@@ -13,7 +13,7 @@
   ],
   "scripts": {
     "start": "node cli.mjs",
-    "test": "node --test test/lock.test.mjs test/cli.test.mjs",
+    "test": "node --test test/lock.test.mjs test/cli.test.mjs test/qr.test.mjs",
     "test:browser": "node --test test/browser.test.mjs"
   },
   "keywords": [
