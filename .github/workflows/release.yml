@@ -1,0 +1,53 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: npm-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    uses: ./.github/workflows/test.yml
+
+  publish:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - name: Check release version
+        id: version
+        run: |
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { appendFileSync, readFileSync } from 'node:fs';
+
+          const pkg = JSON.parse(readFileSync('package.json', 'utf8'));
+          const lock = JSON.parse(readFileSync('package-lock.json', 'utf8'));
+          assert.equal(process.env.GITHUB_REF_NAME, `v${pkg.version}`, 'Tag must match package.json version');
+          assert.equal(lock.version, pkg.version, 'Lockfile version must match package.json');
+          assert.equal(lock.packages[''].version, pkg.version, 'Lockfile root version must match package.json');
+
+          const distTag = pkg.version.includes('-') ? 'next' : 'latest';
+          appendFileSync(process.env.GITHUB_OUTPUT, `dist_tag=${distTag}\n`);
+          NODE
+      - run: npm ci
+      - run: npm pack --dry-run
+      - name: Publish to npm
+        run: npm publish --access public --provenance --tag "${{ steps.version.outputs.dist_tag }}"

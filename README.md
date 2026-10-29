@@ -160,6 +160,28 @@ public brokers by default; point `FREEDROP_TEST_BROKER` at a local
 `ws://` MQTT broker for a hermetic run — CI does exactly that with
 mosquitto (see `.github/workflows/test.yml`).
 
+## Publishing
+
+Push a `v<version>` tag to publish to npm through
+`.github/workflows/release.yml`. The workflow uses npm Trusted Publishing
+(GitHub Actions OIDC), so no npm token secret is needed. The npm trusted
+publisher must allow `npm publish` for owner `tiann`, repository `freedrop`,
+workflow filename `release.yml`, with no environment name.
+
+From an up-to-date `main`, with a clean working tree:
+
+```bash
+npm version patch
+git push origin main --follow-tags
+```
+
+`npm version` updates both package files and creates the version commit
+and tag. The workflow runs the CLI and browser test suites before
+publishing, and checks that the tag matches the version in both
+`package.json` and `package-lock.json`. Stable versions publish under
+`latest`; prereleases (for example, `v0.7.0-beta.1`) publish under `next`.
+Each version can only be published once.
+
 ## Built on
 
 [node-datachannel](https://github.com/murat-dogan/node-datachannel) with a

@@ -3,6 +3,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_call:
 
 # Both jobs run hermetically: signaling goes through a local mosquitto
 # (ws:// MQTT) instead of the public brokers, and the data path is
