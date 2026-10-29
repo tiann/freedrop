@@ -102,6 +102,8 @@ the missing ranges travel. Files appear under their final names only
 after verification, and the staging directory disappears when the
 transfer completes. That covers every way a transfer dies:
 
+- **First connection** — no signaling progress for ~5 s triggers a fresh
+  handshake, with a ~15 s connection window and no page reload.
 - **Network blip** — both ends stay running, re-negotiate through the
   rendezvous room, and continue automatically (the receiver retries for
   ~90 s before giving up; the journal survives either way).

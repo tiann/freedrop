@@ -11,6 +11,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { chromium } from "playwright";
 import { createServer } from "node:http";
+import { randomBytes } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
@@ -89,6 +90,124 @@ const saveDownloads = async (page, got, names) => {
 const pageDone = (page, ms = 120_000) =>
     waitFor(() => page.locator("#status").textContent().then((s) => s.includes("✓")), ms, "✓ in #status");
 
+// Exercise public-broker reordering deterministically, even on loopback.
+// SDP can trail trickled ICE, and installing it is itself asynchronous.
+const signalingRace = async (page, mode) => {
+    await page.addInitScript(() => {
+        window.signalRace = { early: [], applied: [], hellos: [], dropped: 0 };
+        const add = RTCPeerConnection.prototype.addIceCandidate;
+        RTCPeerConnection.prototype.addIceCandidate = async function (candidate) {
+            await add.call(this, candidate);
+            window.signalRace.applied.push(candidate.candidate);
+        };
+        const set = RTCPeerConnection.prototype.setRemoteDescription;
+        RTCPeerConnection.prototype.setRemoteDescription = async function (description) {
+            await new Promise((r) => setTimeout(r, 200));
+            return set.call(this, description);
+        };
+    });
+    await page.route("**/signal.mjs", async (route) => {
+        const response = await route.fetch();
+        const body = await response.text();
+        await route.fulfill({ response, body: body + `
+const createRoom = SignalRoom.create;
+SignalRoom.create = async function (...args) {
+    const room = await createRoom.apply(this, args);
+    const mode = ${JSON.stringify(mode)};
+    const released = new Set();
+    let handler = null;
+    let blockedSid = null;
+    Object.defineProperty(room, "onmessage", {
+        set: (fn) => { handler = fn; },
+        get: () => (msg) => {
+            const conn = msg.conn ?? 0;
+            if (mode === "stall" && msg.t === "offer" && !blockedSid) blockedSid = msg.sid;
+            if (mode === "early-ice") {
+                if (msg.t === "offer" || msg.t === "answer") {
+                    msg.sdp = msg.sdp.replace(/^a=(?:candidate:.*|end-of-candidates)\\r?\\n/gm, "");
+                    setTimeout(() => { released.add(conn); handler?.(msg); }, 300);
+                    return;
+                }
+                if (msg.t === "ice" && !released.has(conn)) window.signalRace.early.push(msg.candidate.candidate);
+            }
+            handler?.(msg);
+        },
+    });
+    const send = room.send.bind(room);
+    room.send = (msg) => {
+        if (msg.t === "hello") window.signalRace.hellos.push(msg.sid);
+        if (mode === "stall" && msg.sid === blockedSid && (msg.t === "answer" || msg.t === "ice")) {
+            window.signalRace.dropped++;
+            return Promise.resolve();
+        }
+        return send(msg);
+    };
+    return room;
+};` });
+    });
+};
+
+test("CLI → browser: ICE before SDP survives a cold first visit", { timeout: 90_000 }, async (t) => {
+    const W = makeDir(join(TMP, "early-ice"));
+    await makeRandom(join(W, "aaa.txt"), 1024);
+    const sender = startCli(["--no-qr", join(W, "aaa.txt")]);
+    t.after(() => sender.kill("SIGKILL"));
+    const code = await transferCode(sender);
+    const page = await newPage("early-ice");
+    t.after(() => page.context().close());
+    await signalingRace(page, "early-ice");
+    const got = collectDownloads(page);
+    await page.goto(`${BASE}/#${code}`);
+    await page.getByRole("button", { name: /Save|保存/ }).click({ timeout: 15_000 });
+    await pageDone(page);
+    const race = await page.evaluate(() => window.signalRace);
+    assert.ok(race.early.length, "the test must deliver ICE before the offer");
+    for (const candidate of race.early) assert.ok(race.applied.includes(candidate), "early ICE must reach the peer");
+    const hashes = await saveDownloads(page, got, ["aaa.txt"]);
+    assert.equal(hashes["aaa.txt"], await sha256(join(W, "aaa.txt")));
+    assert.equal(await exited(sender), 0, sender.out);
+});
+
+test("CLI → browser: stalled first handshake retries without a page reload", { timeout: 90_000 }, async (t) => {
+    const W = makeDir(join(TMP, "first-retry"));
+    await makeRandom(join(W, "aaa.txt"), 1024);
+    const sender = startCli(["--no-qr", join(W, "aaa.txt")]);
+    t.after(() => sender.kill("SIGKILL"));
+    const code = await transferCode(sender);
+    const page = await newPage("first-retry");
+    t.after(() => page.context().close());
+    await signalingRace(page, "stall");
+    await page.clock.install();
+    const got = collectDownloads(page);
+    await page.goto(`${BASE}/#${code}`);
+    // Let the delayed setRemoteDescription finish before advancing the
+    // handshake watchdog. The first answer is deliberately discarded.
+    await page.clock.resume();
+    await waitFor(() => page.evaluate(() => window.signalRace.dropped > 0), 10_000, "discarded first answer");
+    await page.clock.fastForward(5500);
+    await page.getByRole("button", { name: /Save|保存/ }).click({ timeout: 10_000 });
+    await pageDone(page);
+    const race = await page.evaluate(() => window.signalRace);
+    assert.ok(new Set(race.hellos).size >= 2, "a fresh attempt must replace the stalled handshake");
+    const hashes = await saveDownloads(page, got, ["aaa.txt"]);
+    assert.equal(hashes["aaa.txt"], await sha256(join(W, "aaa.txt")));
+    assert.equal(await exited(sender), 0, sender.out);
+});
+
+test("browser: an absent sender stops retries after the connection window", { timeout: 30_000 }, async (t) => {
+    const page = await newPage("no-sender");
+    t.after(() => page.context().close());
+    await signalingRace(page, "observe");
+    await page.clock.install();
+    await page.goto(`${BASE}/#${randomBytes(32).toString("base64url")}`);
+    await waitFor(() => page.evaluate(() => window.signalRace.hellos.length), 10_000, "first hello");
+    await page.clock.fastForward(15_000);
+    assert.match(await page.locator("#status.error").textContent(), /no sender found|找不到发送方/i);
+    const hellos = await page.evaluate(() => window.signalRace.hellos.length);
+    await page.clock.fastForward(60_000);
+    assert.equal(await page.evaluate(() => window.signalRace.hellos.length), hellos, "terminal failure must stop retrying");
+});
+
 test("CLI → browser: striped big + small + empty", { timeout: 300_000 }, async () => {
     const W = makeDir(join(TMP, "c2b"));
     await makeRandom(join(W, "big.bin"), 100e6);
@@ -126,22 +245,29 @@ test("browser → CLI: striped big + small + empty", { timeout: 300_000 }, async
     await page.context().close();
 });
 
-test("browser → browser: multi-file", { timeout: 300_000 }, async () => {
+test("browser → browser: multi-file with ICE before offers and answers", { timeout: 300_000 }, async () => {
     const W = makeDir(join(TMP, "b2b"));
     await makeRandom(join(W, "small.bin"), 3e6);
     await makeRandom(join(W, "empty.bin"), 0);
     const sendPage = await newPage("b2b-send");
+    await signalingRace(sendPage, "early-ice");
     await sendPage.goto(`${BASE}/`);
     await sendPage.setInputFiles("#picker", [join(W, "small.bin"), join(W, "empty.bin")]);
     const code = await waitFor(() => sendPage.locator("#link").textContent()
         .then((s) => s.match(/npx freedrop ([A-Za-z0-9_-]{40,48})/)?.[1]), 30_000, "browser code");
     const recvPage = await newPage("b2b-recv");
+    await signalingRace(recvPage, "early-ice");
     const got = collectDownloads(recvPage);
     await recvPage.goto(`${BASE}/#${code}`);
     await recvPage.getByRole("button", { name: /Save|保存/ }).click({ timeout: 30_000 });
     await pageDone(recvPage);
     const hashes = await saveDownloads(recvPage, got, ["small.bin", "empty.bin"]);
     for (const n of Object.keys(hashes)) assert.equal(hashes[n], await sha256(join(W, n)), n);
+    for (const page of [sendPage, recvPage]) {
+        const race = await page.evaluate(() => window.signalRace);
+        assert.ok(race.early.length, "ICE must arrive before SDP on both sides");
+        for (const candidate of race.early) assert.ok(race.applied.includes(candidate), "early ICE must reach the peer");
+    }
     await sendPage.context().close();
     await recvPage.context().close();
 });

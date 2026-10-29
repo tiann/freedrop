@@ -248,3 +248,28 @@ export class SignalRoom {
         for (const c of this.#clients) c.close();
     }
 }
+
+// Trickle ICE may beat the SDP across brokers, or arrive while the
+// asynchronous setRemoteDescription is still pending. Keep an inbox per
+// attempt and connection, including connections that do not exist yet.
+export class IceInbox {
+    #peers = new Map();
+    #pending = new Map();
+
+    add(conn, candidate) {
+        const pc = this.#peers.get(conn);
+        if (pc) {
+            pc.addIceCandidate(candidate).catch(() => {});
+        } else {
+            if (!this.#pending.has(conn)) this.#pending.set(conn, []);
+            this.#pending.get(conn).push(candidate);
+        }
+    }
+
+    async setRemoteDescription(conn, pc, description) {
+        await pc.setRemoteDescription(description);
+        this.#peers.set(conn, pc);
+        for (const candidate of this.#pending.get(conn) ?? []) this.add(conn, candidate);
+        this.#pending.delete(conn);
+    }
+}

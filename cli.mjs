@@ -25,7 +25,7 @@ import { basename, join } from "node:path";
 import { randomBytes, createHash } from "node:crypto";
 import { createInterface } from "node:readline";
 import qrcode from "qrcode-terminal";
-import { SignalRoom, b64u, DEFAULT_BROKERS } from "./signal.mjs";
+import { SignalRoom, IceInbox, b64u, DEFAULT_BROKERS } from "./signal.mjs";
 import { acquireLeaseLock } from "./lock.mjs";
 
 const PAGE = process.env.FREEDROP_PAGE ?? "https://freedrop.dev/";
@@ -190,7 +190,9 @@ const LOW_WATER = HIGH_WATER / 4;
 const STRIPE_CONNS = 4;
 const STRIPE_MIN = 64 * 1024 * 1024;
 
-// how long the accepted side keeps re-negotiating before giving up (the
+const HANDSHAKE_TIMEOUT = 5000;
+const CONNECT_WINDOW = 15_000;
+// how long the receiver keeps re-negotiating before giving up (the
 // journal survives either way — a later run resumes)
 const RETRY_WINDOW = 90_000;
 
@@ -642,7 +644,7 @@ async function send(paths) {
         // stripes need native engines on both ends; werift ends say 1
         const maxConns = native ? Math.min(connsWanted ?? 1, STRIPE_CONNS) : 1;
         const a = {
-            sid, conns: [], dead: false, streaming: false,
+            sid, conns: [], ice: new IceInbox(), dead: false, streaming: false,
             drainResolve: null, chunkSize: 16 * 1024 - 9,
         };
         at = a;
@@ -717,7 +719,7 @@ async function send(paths) {
             await pc.setLocalDescription(offer);
             // TURN rides along so the receiving side gets a relay path too
             room.send({ sid: a.sid, t: "offer", sdp: pc.localDescription.sdp, ice: turn });
-        })().catch((e) => die(`webrtc: ${e.message}`));
+        })().catch((e) => { if (at === a && !a.dead) die(`webrtc: ${e.message}`); });
         if (total >= STRIPE_MIN) {
             for (let k = 1; k < maxConns; k++) addStripe(a, k);
         }
@@ -737,9 +739,10 @@ async function send(paths) {
         } else if (msg.t === "answer") {
             const k = msg.conn ?? 0;
             if (k === 0) at.chunkSize = chunkFor(msg.sdp);
-            at.conns[k]?.pc.setRemoteDescription({ type: "answer", sdp: msg.sdp }).catch(() => {});
+            const pc = at.conns[k]?.pc;
+            if (pc) at.ice.setRemoteDescription(k, pc, { type: "answer", sdp: msg.sdp }).catch(() => {});
         } else if (msg.t === "ice") {
-            at.conns[msg.conn ?? 0]?.pc.addIceCandidate(msg.candidate).catch(() => {});
+            at.ice.add(msg.conn ?? 0, msg.candidate);
         }
     };
 }
@@ -760,6 +763,7 @@ async function send(paths) {
 // later one.
 
 async function receive(code) {
+    const startedAt = Date.now();
     const key = b64u.decode(code);
     const outDir = flags.out ?? ".";
     // the staging directory is named by a hash of the code — never the
@@ -769,7 +773,8 @@ async function receive(code) {
     const stageRoot = join(outDir, ".freedrop-stage");
     const stageDir = join(stageRoot, rid);
     const turnExtra = await turnServers();
-    const room = await SignalRoom.create({ key, role: "viewer", brokers: BROKERS })
+    const waitMs = Math.min(10_000, Math.max(1, CONNECT_WINDOW - (Date.now() - startedAt)));
+    const room = await SignalRoom.create({ key, role: "viewer", brokers: BROKERS, waitMs })
         .catch((e) => die(`cannot reach any rendezvous broker: ${e.message}`));
 
     // ---- transfer state (survives attempts) ----
@@ -789,8 +794,7 @@ async function receive(code) {
 
     // ---- attempt state ----
     let at = null; // { sid, pcs: [{ pc, ch, rx, last }], dc, gotOffer }
-    const startedAt = Date.now();
-    let connectedOnce = false;
+    let senderFound = false;
     let disconnectedAt = 0;
     let lastData = Date.now();
 
@@ -1180,8 +1184,10 @@ async function receive(code) {
             c.last = offset;
             return onChunk(offset, chunk);
         }
-        if (msg.t === "manifest") onManifest(msg);
-        else if (msg.t === "hash") {
+        if (msg.t === "manifest") {
+            at.gotManifest = true;
+            onManifest(msg);
+        } else if (msg.t === "hash") {
             const f = files?.[msg.i];
             if (f && !f.done && typeof msg.sha === "string") {
                 f.sha = msg.sha;
@@ -1192,15 +1198,16 @@ async function receive(code) {
 
     const teardownAttempt = () => {
         if (!at) return;
-        for (const c of at.pcs) { try { c?.pc.close(); } catch {} }
+        const a = at;
         at = null;
+        for (const c of a.pcs) { try { c?.pc.close(); } catch {} }
     };
 
     const startAttempt = () => {
         teardownAttempt();
         at = {
             sid: randomBytes(8).toString("hex"),
-            pcs: [], dc: null, gotOffer: false,
+            pcs: [], ice: new IceInbox(), dc: null, gotOffer: false, gotManifest: false, lastSignalAt: Date.now(),
         };
         room.send({ sid: at.sid, t: "hello", conns: native ? STRIPE_CONNS : 1 });
     };
@@ -1208,15 +1215,15 @@ async function receive(code) {
     const retry = (why) => {
         if (finished) return;
         dbg?.(`retry: ${why}`);
-        if (!acceptedEver && !manifest) {
-            // the channel never proved itself — almost always NAT, and
-            // retrying the same pair of networks will not do better. A
-            // failure AFTER the manifest crossed (say, while the user
-            // reads the prompt) is not NAT: fall through and reconnect.
-            if (connectedOnce) die(NAT_HINT);
-            return; // pre-connection: the hello re-send loop is still trying
-        }
         const now = Date.now();
+        if (!manifest) {
+            if (now - startedAt >= CONNECT_WINDOW) {
+                die(senderFound ? NAT_HINT : "no sender found — is `freedrop <files>` still running on the other side?");
+            }
+            status("connection lost — reconnecting…");
+            startAttempt();
+            return;
+        }
         if (!disconnectedAt) disconnectedAt = now;
         if (now - disconnectedAt > RETRY_WINDOW) return giveUp();
         flushStates();
@@ -1227,13 +1234,14 @@ async function receive(code) {
 
     room.onmessage = async (msg) => {
         if (!at || msg.sid !== at.sid) return;
+        if ((msg.conn ?? 0) === 0 && (msg.t === "offer" || msg.t === "ice")) at.lastSignalAt = Date.now();
         if (msg.t === "offer") {
             const k = msg.conn ?? 0;
             if (at.pcs[k]) return; // replayed offer
             const a = at;
             a.gotOffer = true;
             if (k === 0) {
-                connectedOnce = true;
+                senderFound = true;
                 status(manifest ? "reconnected…" : "sender found, connecting…");
             }
             const pc = new RTCPeerConnection({ iceServers: [...STUN, ...(msg.ice ?? []), ...turnExtra] });
@@ -1245,7 +1253,7 @@ async function receive(code) {
                 if (k === 0 || c.rx) retry(`conn ${k} failed`);
             };
             pc.ondatachannel = (e) => {
-                if (c.ch) return;
+                if (at !== a || c.ch) return;
                 dbg?.(`recv conn ${k} dc arrived`);
                 c.ch = e.channel;
                 c.ch.binaryType = "arraybuffer";
@@ -1254,22 +1262,26 @@ async function receive(code) {
                     if (at === a && k === 0) retry("control channel closed");
                 };
                 c.ch.onmessage = (ev) => {
+                    if (at !== a) return;
                     c.rx = true;
                     onFrame(c, ev);
                 };
-                if (k === 0) at.dc = c.ch;
+                if (k === 0) a.dc = c.ch;
             };
             pc.onicecandidate = (e) => {
-                if (e.candidate) room.send({ sid: a.sid, t: "ice", conn: k, candidate: candJson(e.candidate) });
+                if (at !== a || !e.candidate) return;
+                if (k === 0) a.lastSignalAt = Date.now();
+                room.send({ sid: a.sid, t: "ice", conn: k, candidate: candJson(e.candidate) });
             };
             (async () => {
-                await pc.setRemoteDescription({ type: "offer", sdp: msg.sdp });
+                await a.ice.setRemoteDescription(k, pc, { type: "offer", sdp: msg.sdp });
+                if (at !== a) return;
                 const answer = await pc.createAnswer();
                 await pc.setLocalDescription(answer);
-                room.send({ sid: a.sid, t: "answer", conn: k, sdp: pc.localDescription.sdp });
-            })().catch((e) => die(`webrtc: ${e.message}`));
+                if (at === a) room.send({ sid: a.sid, t: "answer", conn: k, sdp: pc.localDescription.sdp });
+            })().catch((e) => { if (at === a) retry(`webrtc: ${e.message}`); });
         } else if (msg.t === "ice") {
-            at.pcs[msg.conn ?? 0]?.pc.addIceCandidate(msg.candidate).catch(() => {});
+            at.ice.add(msg.conn ?? 0, msg.candidate);
         }
     };
 
@@ -1293,10 +1305,8 @@ async function receive(code) {
     const healthTimer = setInterval(() => {
         if (finished || !at) return;
         const now = Date.now();
-        if (!connectedOnce) {
-            if (now - startedAt > 20_000) {
-                die("no sender found — is `freedrop <files>` still running on the other side?");
-            }
+        if (!at.gotManifest) {
+            if ((!manifest && now - startedAt >= CONNECT_WINDOW) || now - at.lastSignalAt >= HANDSHAKE_TIMEOUT) retry("handshake timeout");
             return;
         }
         if (!acceptedEver) return; // waiting at the prompt is not a stall
@@ -1304,7 +1314,7 @@ async function receive(code) {
         if (coveredTotal === total && allShaKnown) return; // verifying locally
         const grace = coveredTotal === total ? 30_000 : 20_000;
         if (now - lastData > grace) retry("no data");
-    }, 3000);
+    }, 1000);
     healthTimer.unref?.();
 
     startAttempt();

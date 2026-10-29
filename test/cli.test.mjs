@@ -46,6 +46,34 @@ test("fresh transfer: striped big + small + empty, verified", { timeout: 240_000
     assert.ok(noStage(dst), "staging directory cleaned up");
 });
 
+test("slow trickle ICE setup completes within the first connection window", { timeout: 45_000 }, async (t) => {
+    const W = makeDir(join(TMP, "slow-handshake"));
+    const dst = makeDir(join(W, "dst"));
+    await makeRandom(join(W, "aaa.txt"), 1024);
+    // Werift can spend five seconds gathering ICE before its local SDP
+    // promise resolves. Both ends must get to finish that work while
+    // trickled candidates are already proving signaling is alive.
+    const preload = `
+        const { RTCPeerConnection } = await import(${JSON.stringify(import.meta.resolve("werift"))});
+        const set = RTCPeerConnection.prototype.setLocalDescription;
+        RTCPeerConnection.prototype.setLocalDescription = async function (description) {
+            const result = await set.call(this, description);
+            await new Promise((r) => setTimeout(r, 5000));
+            return result;
+        };
+    `;
+    const env = { FREEDROP_RTC: "js", NODE_OPTIONS: `--import=data:text/javascript,${encodeURIComponent(preload)}` };
+    const sender = startCli(["--no-qr", join(W, "aaa.txt")], env);
+    t.after(() => sender.kill("SIGKILL"));
+    const code = await transferCode(sender);
+    const recv = startCli(["-y", "-o", dst, code], env);
+    t.after(() => recv.kill("SIGKILL"));
+    assert.equal(await exited(recv, 25_000), 0, recv.out);
+    assert.equal(await exited(sender), 0, sender.out);
+    assert.doesNotMatch(recv.out, /reconnecting/, "a progressing handshake must not be discarded");
+    assert.equal(await sha256(join(dst, "aaa.txt")), await sha256(join(W, "aaa.txt")));
+});
+
 test("receiver SIGKILLed mid-transfer, re-run resumes", { timeout: 300_000 }, async () => {
     const W = makeDir(join(TMP, "kill-recv"));
     const dst = makeDir(join(W, "dst"));
