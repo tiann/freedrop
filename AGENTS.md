@@ -13,6 +13,7 @@ code won't tell you at a glance.
 | `signal.mjs` | rendezvous over MQTT (encrypted room, SDP/ICE exchange), used by both CLI and page |
 | `lock.mjs` | directory lease lock guarding the CLI receiver's staging directory |
 | `qr.mjs` | dependency-free QR encoder for the page |
+| `sw.js`, `manifest.webmanifest`, `icons/` | the installable app: network-first shell cache, share target, "Scan" shortcut |
 | `test/` | `node --test` suites; `helpers.mjs` spawns real CLI processes |
 | `llms.txt` | usage guide for AI agents, served at freedrop.dev/llms.txt |
 
@@ -70,6 +71,16 @@ site.
   Plausible-looking changes here have failed under multi-process stress
   before; a change needs an adversarial test in the style of
   `test/lock.test.mjs`.
+- **`SHELL` in `sw.js` lists every file the page loads.** A file left
+  out still works online and is missing only from an offline start (the
+  browser tests catch a missing module, not a missing icon). A listed
+  file that doesn't exist fails the worker's install, and the page
+  silently stops being installable — the tests catch that.
+- **The service worker hides requests from `page.route`.** Once a page
+  is controlled (from its second load on), Playwright's `page.route`
+  no longer sees its fetches — route only a context's first visit, as
+  `signalingRace` does, or create the context with
+  `serviceWorkers: "block"`.
 
 ## Output the tests depend on
 
@@ -105,6 +116,9 @@ Web page — `test/browser.test.mjs` reads state from the DOM:
   `BarcodeDetector` and the camera (headless Linux Chromium has neither)
 - a sending page sets `onbeforeunload`, so a test that reloads or
   navigates away from it gets blocked
+- the installed app's ways in: a multipart POST of `files` to
+  `./?share-target` starts sending them, `./?scan` opens the scanner;
+  both leave the URL at `./`. `#install` shows on `beforeinstallprompt`
 
 ## Releasing
 

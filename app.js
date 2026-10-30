@@ -80,6 +80,7 @@ const T = zh ? {
     notOurs: "这不是 freedrop 的二维码",
     noCamera: "打不开相机 — 请允许此页面使用相机",
     cancel: "取消",
+    install: "安装应用",
 } : {
     tagline: "Peer-to-peer file transfer, no server in between",
     dropTitle: touch ? "Choose files to send" : "Drop files here",
@@ -129,6 +130,7 @@ const T = zh ? {
     notOurs: "That QR code isn't a freedrop link",
     noCamera: "Can't open the camera — allow this page to use it",
     cancel: "Cancel",
+    install: "Install app",
 };
 
 const $ = (id) => document.getElementById(id);
@@ -658,6 +660,23 @@ if (typeof RTCPeerConnection === "undefined") {
     sendMode();
 }
 
+// The service worker (sw.js) makes this an installable app: a shell that
+// starts offline, and Android's share sheet as a way to send. Chrome
+// offers installing from its menu only — surface it while it can.
+addEventListener("load", () => navigator.serviceWorker?.register("./sw.js").catch(() => {}));
+let installPrompt = null;
+$("install").textContent = T.install;
+addEventListener("beforeinstallprompt", (e) => {
+    installPrompt = e;
+    $("install").hidden = false;
+});
+addEventListener("appinstalled", () => { $("install").hidden = true; });
+$("install").onclick = () => {
+    $("install").hidden = true;
+    installPrompt?.prompt().catch(() => {});
+    installPrompt = null;
+};
+
 // ---- send ------------------------------------------------------------------
 // A loop of attempts, like the CLI: each receiver hello gets fresh
 // connections and a manifest; accept {have} starts one sequential pass
@@ -687,7 +706,20 @@ function sendMode() {
     $("picker").onchange = () => go([...$("picker").files]);
     $("scan-label").textContent = T.scan;
     $("scan").onclick = scan;
-    canScan().then((ok) => { $("scan").hidden = !ok || $("drop").hidden; });
+    // ways in from the installed app: Android's share sheet (the service
+    // worker holds the shared files for us) and the "Scan" icon shortcut
+    const via = new URLSearchParams(location.search);
+    if (location.search) history.replaceState(null, "", location.pathname);
+    if (via.has("share-target") && navigator.serviceWorker) {
+        navigator.serviceWorker.addEventListener("message", (e) => {
+            if (e.data?.t === "share" && !$("drop").hidden) go(e.data.files);
+        });
+        navigator.serviceWorker.ready.then((r) => r.active.postMessage("share-ready"));
+    }
+    canScan().then((ok) => {
+        $("scan").hidden = !ok || $("drop").hidden;
+        if (ok && via.has("scan") && !$("drop").hidden) scan();
+    });
 
     async function start(files) {
         if (!files.length) return;

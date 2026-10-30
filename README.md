@@ -30,6 +30,13 @@ the sender's QR code and the transfer opens right there, no camera-app
 detour. A finished transfer offers the same button, so a phone can take one
 transfer after another without going back to the start page.
 
+The page is also an installable app (a PWA): **Install app** at the bottom
+of the page, or the browser's own menu. Installed on Android, freedrop
+shows up in the share sheet — share photos or files from any app and they
+go straight to sending — and long-pressing its icon offers **Scan to
+receive**. The installed app starts offline too, though a transfer still
+needs the network.
+
 ## How it works
 
 The code after `npx freedrop` is a 256-bit key, generated fresh per

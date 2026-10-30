@@ -8,6 +8,8 @@
 <meta name="theme-color" content="#0e0f11" media="(prefers-color-scheme: dark)">
 <title>freedrop</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%232f6bed'/%3E%3Cpath d='M16 8v13m-5.5-5.5L16 21l5.5-5.5M10 24h12' fill='none' stroke='%23fff' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<link rel="manifest" href="manifest.webmanifest">
 <style>
     :root {
         --bg: #f5f6f8; --card: #fff; --text: #17181a; --muted: #6b6f76; --faint: #9a9ea6;
@@ -146,9 +148,11 @@
 
     #trust { display: flex; align-items: center; justify-content: center; gap: .4rem; font-size: .8rem; color: var(--faint); }
     #trust svg { width: 13px; height: 13px; }
-    footer { font-size: .8rem; color: var(--faint); }
+    footer { display: flex; align-items: center; gap: .9rem; font-size: .8rem; color: var(--faint); }
     footer a { color: inherit; text-decoration: none; }
     footer a:hover { color: var(--muted); text-decoration: underline; }
+    #install { padding: 0; border-radius: 0; background: none; color: var(--accent); font-weight: 500; }
+    #install:hover { background: none; text-decoration: underline; }
     @keyframes spin { to { transform: rotate(360deg); } }
     @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation-duration: 2.4s !important; } }
     @media (max-width: 480px) {
@@ -192,7 +196,7 @@
     <div id="actions" hidden></div>
     <div id="trust"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg><span id="trust-text"></span></div>
 </main>
-<footer><a href="https://github.com/tiann/freedrop">github.com/tiann/freedrop</a></footer>
+<footer><a href="https://github.com/tiann/freedrop">github.com/tiann/freedrop</a><button id="install" type="button" hidden></button></footer>
 <script type="module" src="./app.js"></script>
 </body>
 </html>

@@ -24,7 +24,10 @@ const DL = makeDir(join(TMP, "dl"));
 
 // ---- static server; FREEDROP_TEST_BROKER rewrites the broker list the
 // page ships with, so a hermetic run stays hermetic in the browser too
-const MIME = { html: "text/html", js: "text/javascript", mjs: "text/javascript" };
+const MIME = {
+    html: "text/html", js: "text/javascript", mjs: "text/javascript",
+    webmanifest: "application/manifest+json", png: "image/png",
+};
 const server = createServer(async (req, res) => {
     const p = req.url.split(/[?#]/)[0];
     const file = p === "/" ? "/index.html" : p;
@@ -356,6 +359,14 @@ test("browser: the scan button needs a QR detector; cancelling or a denied camer
     await denied.getByRole("button", { name: /Cancel|取消/ }).click();
     assert.ok(await scanButton(denied).isVisible(), "the button stays for another try");
     assert.ok(await denied.locator("#hint").isHidden());
+
+    // the installed app's "Scan" shortcut opens straight into the scanner
+    const shortcut = await newPage("scan-shortcut");
+    t.after(() => shortcut.context().close());
+    await fakeScanner(shortcut);
+    await shortcut.goto(`${BASE}/?scan`);
+    await shortcut.locator("#viewfinder").waitFor({ timeout: 5_000 });
+    assert.equal(shortcut.url(), `${BASE}/`, "the shortcut's query is dropped from the URL");
 });
 
 test("CLI → browser: scanning QR codes receives on this page, one transfer after another", { timeout: 120_000 }, async (t) => {
@@ -400,6 +411,82 @@ test("CLI → browser: scanning QR codes receives on this page, one transfer aft
     await pageDone(page);
     assert.equal((await saveDownloads(page, got, ["bbb.txt"]))["bbb.txt"], await sha256(join(W, "bbb.txt")));
     assert.equal(await exited(senderB), 0, senderB.out);
+});
+
+// the page once its service worker controls it — the point from which
+// it is an installed app's page
+const controlled = (page) => waitFor(() => page.evaluate(() => !!navigator.serviceWorker.controller),
+    10_000, "service worker in control");
+
+test("browser: installable — manifest, icons, an offline start, and the install button", { timeout: 30_000 }, async (t) => {
+    const page = await newPage("pwa");
+    t.after(() => page.context().close());
+    await page.goto(`${BASE}/`);
+    const manifestUrl = await page.locator("link[rel=manifest]").evaluate((l) => l.href);
+    const manifest = await (await page.request.get(manifestUrl)).json();
+    assert.equal(manifest.display, "standalone");
+    assert.equal(new URL(manifest.start_url, manifestUrl).href, `${BASE}/`);
+    assert.ok(manifest.icons.some((i) => i.sizes === "192x192" && !i.purpose), "a 192px icon");
+    assert.ok(manifest.icons.some((i) => i.sizes === "512x512" && !i.purpose), "a 512px icon");
+    assert.ok(manifest.icons.some((i) => i.purpose === "maskable"), "a maskable icon");
+    // every icon is a PNG of the size it claims
+    const icons = [...manifest.icons, ...manifest.shortcuts.flatMap((s) => s.icons),
+        { src: await page.locator("link[rel=apple-touch-icon]").getAttribute("href"), sizes: "180x180" }];
+    for (const icon of icons) {
+        const res = await page.request.get(new URL(icon.src, manifestUrl).href);
+        assert.equal(res.status(), 200, icon.src);
+        const png = await res.body();
+        assert.equal(png.subarray(1, 4).toString(), "PNG", icon.src);
+        assert.equal(`${png.readUInt32BE(16)}x${png.readUInt32BE(20)}`, icon.sizes, icon.src);
+    }
+    const share = manifest.share_target;
+    assert.deepEqual([share.method, share.enctype, share.params.files[0].name], ["POST", "multipart/form-data", "files"]);
+    assert.equal(new URL(share.action, manifestUrl).href, `${BASE}/?share-target`);
+
+    await controlled(page);
+    await page.context().setOffline(true);
+    await page.reload();
+    await page.locator("#drop").waitFor({ timeout: 5_000 });
+    await page.context().setOffline(false);
+
+    assert.ok(await page.locator("#install").isHidden(), "nothing to offer before the browser does");
+    await page.evaluate(() => {
+        window.prompted = 0;
+        const e = new Event("beforeinstallprompt");
+        e.prompt = async () => { window.prompted++; };
+        dispatchEvent(e);
+    });
+    await page.getByRole("button", { name: /Install|安装/ }).click();
+    assert.equal(await page.evaluate(() => window.prompted), 1);
+    assert.ok(await page.locator("#install").isHidden());
+});
+
+test("browser → CLI: files shared from another app go straight to sending", { timeout: 90_000 }, async (t) => {
+    const W = makeDir(join(TMP, "share-target"));
+    const dst = makeDir(join(W, "dst"));
+    await makeRandom(join(W, "aaa.bin"), 1024);
+    await makeRandom(join(W, "bbb.bin"), 300_000);
+    const page = await newPage("share-target");
+    t.after(() => page.context().close());
+    await page.goto(`${BASE}/`);
+    await controlled(page);
+    // what Android's share sheet does: a multipart POST navigation to the
+    // manifest's share_target action
+    await page.evaluate(() => {
+        const form = Object.assign(document.createElement("form"),
+            { method: "post", enctype: "multipart/form-data", action: "./?share-target" });
+        form.append(Object.assign(document.createElement("input"), { type: "file", name: "files", multiple: true }));
+        document.body.append(form);
+    });
+    await page.setInputFiles("form input[name=files]", [join(W, "aaa.bin"), join(W, "bbb.bin")]);
+    await page.evaluate(() => document.querySelector("form").submit());
+    const code = await waitFor(() => page.locator("#link").textContent()
+        .then((s) => s.match(/npx freedrop ([A-Za-z0-9_-]{40,48})/)?.[1]).catch(() => null), 30_000, "browser code");
+    assert.equal(page.url(), `${BASE}/`, "the share URL is not left behind to re-share on reload");
+    const recv = startCli(["-y", "-o", dst, code]);
+    assert.equal(await exited(recv), 0, recv.out);
+    await pageDone(page);
+    for (const n of ["aaa.bin", "bbb.bin"]) assert.equal(await sha256(join(dst, n)), await sha256(join(W, n)), n);
 });
 
 test("CLI → browser: striped big + small + empty", { timeout: 300_000 }, async () => {
