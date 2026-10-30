@@ -1,0 +1,301 @@
+<!-- The English home page's content, between the shared top bar and footer
+     (site/build.mjs). {{card}} is the app (site/card.html), {{root}} the way
+     back to the site root. The FAQ becomes the page's FAQPage as it is.
+     Keep in step with home.zh.html. -->
+<section class="hero" id="top"><div class="in">
+    <div class="hero-grid">
+        <div class="hero-copy">
+            <p class="eyebrow">Free · open source · no account</p>
+            <h1>Send files straight to another device</h1>
+            <p class="lead"><strong>freedrop</strong> moves files directly between two devices — browser or terminal, either side. The bytes travel peer-to-peer over end-to-end encrypted WebRTC: nothing is uploaded, nothing is stored, and there is no size limit.</p>
+        </div>
+        <div class="hero-app">
+{{card}}
+        </div>
+        <div class="hero-more">
+            <p class="small">Or from a terminal, with Node.js 22+:</p>
+            <span class="cmd"><span>npx freedrop video.mp4</span><button class="copy" type="button" data-copy="npx freedrop video.mp4" aria-label="Copy command"><svg class="cp" viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h8"/></svg><svg class="ok" viewBox="0 0 24 24"><path d="m5 12.5 4.5 4.5L19 7.5"/></svg></button></span>
+            <ul class="ticks"><li>Any browser, any device</li><li>Resumes if interrupted</li><li>Every byte verified</li></ul>
+        </div>
+    </div>
+    <dl class="stats">
+        <div><dt>0 bytes</dt><dd>of your files stored on any server</dd></div>
+        <div><dt>256-bit</dt><dd>key, made fresh for every transfer</dd></div>
+        <div><dt>~430 MB/s</dt><dd>CLI to CLI, measured on loopback</dd></div>
+        <div><dt>SHA-256</dt><dd>checked over every 4 MiB block</dd></div>
+    </dl>
+</div></section>
+
+<section id="how"><div class="in">
+    <p class="eyebrow">How it works</p>
+    <h2>The only thing in the middle is a handshake</h2>
+    <p class="lead">Two devices can talk directly once they know how to reach each other. freedrop uses public MQTT brokers only to pass that introduction along, encrypted, and then gets out of the way.</p>
+    <figure class="diagram">
+        <svg class="wide" viewBox="0 0 760 280" role="img" aria-label="Files travel directly between the two devices over WebRTC; public MQTT brokers only pass on an encrypted handshake of a few kilobytes.">
+            <path class="dg-hand" d="M150 178C150 112 176 62 215 62"/>
+            <path class="dg-hand" d="M610 178C610 112 584 62 545 62"/>
+            <rect class="dg-broker" x="215" y="22" width="330" height="80" rx="14"/>
+            <text class="dg-t" x="380" y="56" text-anchor="middle">Public MQTT brokers</text>
+            <text class="dg-s" x="380" y="78" text-anchor="middle">pass on the handshake: a few KB, encrypted</text>
+            <rect class="dg-node" x="40" y="178" width="220" height="84" rx="16"/>
+            <circle class="dg-dot" cx="80" cy="220" r="20"/>
+            <path class="dg-arrow" d="M80 228V212m-6 6 6-6 6 6"/>
+            <text class="dg-t" x="112" y="214">Sender</text>
+            <text class="dg-s" x="112" y="236">browser or terminal</text>
+            <rect class="dg-node" x="500" y="178" width="220" height="84" rx="16"/>
+            <circle class="dg-dot" cx="540" cy="220" r="20"/>
+            <path class="dg-arrow" d="M540 212v16m-6-6 6 6 6-6"/>
+            <text class="dg-t" x="572" y="214">Receiver</text>
+            <text class="dg-s" x="572" y="236">browser or terminal</text>
+            <line class="dg-pipe" x1="272" y1="220" x2="488" y2="220"/>
+            <line class="dg-flow" x1="272" y1="220" x2="488" y2="220"/>
+            <text class="dg-a" x="380" y="202" text-anchor="middle">your files</text>
+            <text class="dg-s" x="380" y="250" text-anchor="middle">direct WebRTC · DTLS</text>
+        </svg>
+        <svg class="tall" viewBox="0 0 360 430" role="img" aria-label="Files travel directly between the two devices over WebRTC; public MQTT brokers only pass on an encrypted handshake of a few kilobytes.">
+            <path class="dg-hand" d="M215 48C266 48 290 110 290 168"/>
+            <path class="dg-hand" d="M215 382C266 382 290 320 290 262"/>
+            <rect class="dg-broker" x="226" y="168" width="128" height="94" rx="14"/>
+            <text class="dg-t" x="290" y="203" text-anchor="middle">MQTT brokers</text>
+            <text class="dg-s" x="290" y="225" text-anchor="middle">handshake only,</text>
+            <text class="dg-s" x="290" y="243" text-anchor="middle">encrypted</text>
+            <rect class="dg-node" x="10" y="10" width="205" height="76" rx="16"/>
+            <circle class="dg-dot" cx="48" cy="48" r="20"/>
+            <path class="dg-arrow" d="M48 56V40m-6 6 6-6 6 6"/>
+            <text class="dg-t" x="80" y="43">Sender</text>
+            <text class="dg-s" x="80" y="65">browser or terminal</text>
+            <rect class="dg-node" x="10" y="344" width="205" height="76" rx="16"/>
+            <circle class="dg-dot" cx="48" cy="382" r="20"/>
+            <path class="dg-arrow" d="M48 374v16m-6-6 6 6 6-6"/>
+            <text class="dg-t" x="80" y="377">Receiver</text>
+            <text class="dg-s" x="80" y="399">browser or terminal</text>
+            <line class="dg-pipe" x1="112" y1="98" x2="112" y2="332"/>
+            <line class="dg-flow" x1="112" y1="98" x2="112" y2="332"/>
+            <text class="dg-a" x="128" y="208">your files</text>
+            <text class="dg-s" x="128" y="228">direct · DTLS</text>
+        </svg>
+    </figure>
+    <ol class="steps">
+        <li><h3>Pick files</h3>freedrop makes a fresh 256-bit key for this transfer and shows it three ways: a link, a QR code and an <code>npx freedrop &lt;code&gt;</code> command.</li>
+        <li><h3>Meet</h3>Both ends derive a room from the key and swap a few kilobytes of WebRTC handshake through public MQTT brokers, sealed with AES-256-GCM. The brokers see ciphertext on a random-looking topic.</li>
+        <li><h3>Transfer</h3>The files flow over a WebRTC data channel, straight from one device to the other after NAT hole-punching, DTLS-encrypted end to end. Speed is whatever the path between them allows.</li>
+    </ol>
+    <p class="more"><a href="security/">How it works, step by step →</a></p>
+</div></section>
+
+<section id="anywhere"><div class="in">
+    <p class="eyebrow">Any device, either side</p>
+    <h2>Browser or terminal, sending or receiving</h2>
+    <p class="lead">Every combination works. Whoever receives needs nothing installed: a link opens in any browser, on a phone or a desktop.</p>
+    <div class="grid two">
+        <div class="card">
+            <div class="pair" aria-hidden="true"><span><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M3 9h18M7 6.5h.01M10 6.5h.01"/></svg></span><i></i><span><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M3 9h18M7 6.5h.01M10 6.5h.01"/></svg></span></div>
+            <h3>Browser → browser</h3>
+            <p>Drop files on this page and send the link — or let the other person scan the QR code.</p>
+        </div>
+        <div class="card">
+            <div class="pair" aria-hidden="true"><span><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M3 9h18M7 6.5h.01M10 6.5h.01"/></svg></span><i></i><span><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="m7.5 10 3 2.5-3 2.5M13 15h4"/></svg></span></div>
+            <h3>Browser → terminal</h3>
+            <p>The page also shows an <code>npx freedrop &lt;code&gt;</code> line. Run it on the other machine — or paste the link itself; the command takes either.</p>
+        </div>
+        <div class="card">
+            <div class="pair" aria-hidden="true"><span><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="m7.5 10 3 2.5-3 2.5M13 15h4"/></svg></span><i></i><span><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M3 9h18M7 6.5h.01M10 6.5h.01"/></svg></span></div>
+            <h3>Terminal → browser</h3>
+            <p><code>npx freedrop report.pdf</code> prints a link and a QR code. Scan it with a phone and the file downloads right there.</p>
+        </div>
+        <div class="card">
+            <div class="pair" aria-hidden="true"><span><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="m7.5 10 3 2.5-3 2.5M13 15h4"/></svg></span><i></i><span><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="m7.5 10 3 2.5-3 2.5M13 15h4"/></svg></span></div>
+            <h3>Terminal → terminal</h3>
+            <p>Run the printed <code>npx freedrop &lt;code&gt;</code> on the other machine. No SSH keys, no port forwarding, no shared folder.</p>
+        </div>
+    </div>
+</div></section>
+
+<section id="features"><div class="in">
+    <p class="eyebrow">What you get</p>
+    <h2>Built to be trusted with big files</h2>
+    <div class="grid">
+        <div class="card">
+            <div class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 8h15m-4-4 4 4-4 4M20 16H5m4-4-4 4 4 4"/></svg></div>
+            <h3>No server in the data path</h3>
+            <p>Bytes go device to device. Nothing waits on a server for the other side, and no relay pays for — or reads — your traffic.</p>
+        </div>
+        <div class="card">
+            <div class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg></div>
+            <h3>End-to-end encrypted</h3>
+            <p>DTLS on the wire, AES-256-GCM for the handshake. In a link the key rides the URL fragment, which browsers never send to any server — this site's included.</p>
+        </div>
+        <div class="card">
+            <div class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 12c-2-2.67-4-4-6-4a4 4 0 0 0 0 8c2 0 4-1.33 6-4Zm0 0c2 2.67 4 4 6 4a4 4 0 0 0 0-8c-2 0-4 1.33-6 4Z"/></svg></div>
+            <h3>No size limit, no account</h3>
+            <p>No sign-up, no quota, no expiry timer. The only limit is free space on the receiving side.</p>
+        </div>
+        <div class="card">
+            <div class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12a9 9 0 0 1 15.5-6.2L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-15.5 6.2L3 16"/><path d="M3 21v-5h5"/></svg></div>
+            <h3>Resumes where it stopped</h3>
+            <p>Wi-Fi dropped, laptop closed, process killed: re-run the command or reopen the link, and only the missing byte ranges travel.</p>
+        </div>
+        <div class="card">
+            <div class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 4.5 6v5.5c0 4.6 3.2 8.4 7.5 9.5 4.3-1.1 7.5-4.9 7.5-9.5V6Z"/><path d="m9 12 2 2 4-4"/></svg></div>
+            <h3>Every file verified</h3>
+            <p>SHA-256 over 4 MiB blocks, checked before a file appears under its real name. A source that changed mid-way fails loudly instead of landing corrupt.</p>
+        </div>
+        <div class="card">
+            <div class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M13 2 4 14h7l-1 8 9-12h-7Z"/></svg></div>
+            <h3>Fast where it counts</h3>
+            <p>Native WebRTC in the CLI: about 430 MB/s CLI to CLI on loopback. Transfers over 64 MB stripe across four connections; small files pipeline back to back.</p>
+        </div>
+        <div class="card">
+            <div class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 8V6a2 2 0 0 1 2-2h2m8 0h2a2 2 0 0 1 2 2v2m0 8v2a2 2 0 0 1-2 2h-2m-8 0H6a2 2 0 0 1-2-2v-2M4 12h16"/></svg></div>
+            <h3>Scan to receive</h3>
+            <p>Point a phone at the sender's QR code and the transfer opens in place. Added to the home screen, freedrop joins Android's share sheet.</p>
+        </div>
+        <div class="card">
+            <div class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="8" width="16" height="12" rx="3"/><path d="M12 8V4.5M9 13.5v1M15 13.5v1M2 14h2M20 14h2"/></svg></div>
+            <h3>Made for scripts and agents</h3>
+            <p>No prompts or redraws without a terminal, <code>--json</code> events on stdout, and exit codes that say what to do next.</p>
+        </div>
+    </div>
+</div></section>
+
+<section id="uses"><div class="in">
+    <p class="eyebrow">Where it fits</p>
+    <h2>The transfers that used to be awkward</h2>
+    <div class="grid two">
+        <div class="card">
+            <h3>From a server to your phone</h3>
+            <p>In an SSH session, send the file. The terminal prints a QR code; scan it and the download starts in your phone's browser.</p>
+            <pre class="term"><span class="p">$ </span>npx freedrop build/app-release.apk</pre>
+        </div>
+        <div class="card">
+            <h3>Between two computers, any networks</h3>
+            <p>Home, office, a cloud VM — different networks and NATs are fine. Run the command the sender prints on the other side.</p>
+            <pre class="term"><span class="p">$ </span>npx freedrop dataset.tar
+<span class="d"># on the other machine</span>
+<span class="p">$ </span>npx freedrop uMDpiKrcHEIabTuxSCnCUOTdLoMs4DRLGP0lPmC8gVA</pre>
+        </div>
+        <div class="card">
+            <h3>To someone who has never heard of it</h3>
+            <p>Send them the link. They open it in whatever browser they have and save the files: no app, no sign-up, nothing to explain.</p>
+            <pre class="term">https://freedrop.dev/#uMDpiKrcHEIabTuxSCnCUOTdLoMs4DRLGP0lPmC8gVA</pre>
+        </div>
+        <div class="card">
+            <h3>Out of an AI agent's sandbox</h3>
+            <p>A coding agent on a remote box or in a container sends you what it made, and you get a link. <a href="#agents">More below.</a></p>
+            <pre class="term"><span class="p">$ </span>npx -y freedrop --json --timeout 10m report.pdf</pre>
+        </div>
+    </div>
+    <p class="more"><a href="cli/">Every terminal recipe: SSH, servers, interrupted transfers →</a></p>
+</div></section>
+
+<section class="band" id="agents"><div class="in split">
+    <div>
+        <p class="eyebrow">For AI agents</p>
+        <h2>Let your agent hand you a file</h2>
+        <p class="lead">Coding agents work in sandboxes, containers and remote machines — places your downloads folder can't reach. With freedrop the agent runs one command, gives you a link, and exits once you have every byte. It works the other way too: pick files on your phone, and the agent receives them.</p>
+        <ul class="checks">
+            <li><strong>No terminal, no prompts.</strong> Plain lines, no QR code, no redraws; a receiver without <code>-y</code> exits instead of waiting for an answer.</li>
+            <li><strong>One JSON event per line</strong> with <code>--json</code>: <code>ready</code>, <code>progress</code>, <code>saved</code>, <code>done</code>, <code>error</code>.</li>
+            <li><strong>Exit codes that say what to do next</strong> — <code>8</code>: re-run to resume, <code>4</code>: retry with a TURN relay, <code>7</code>: timed out.</li>
+            <li><strong>A guide written for agents</strong> at <a href="{{root}}llms.txt">freedrop.dev/llms.txt</a>.</li>
+        </ul>
+        <p class="more"><a href="agents/">The full guide for agents →</a></p>
+    </div>
+    <div>
+        <pre class="term"><span class="p">$ </span>npx -y freedrop --json --timeout 10m report.pdf
+{"event":"ready","code":"uMDpiKrc…","link":"https://freedrop.dev/#uMDpiKrc…","files":[{"name":"report.pdf","size":482113}],"total":482113}
+<span class="d"># the agent hands you the link; you open it</span>
+{"event":"progress","bytes":482113,"total":482113}
+{"event":"done","total":482113,"seconds":1.8}
+<span class="p">$ </span>echo $?
+0</pre>
+        <div class="snippet">
+            <div><small>Paste into your agent's instructions</small>To send me files, run <code>npx -y freedrop --json &lt;files&gt;</code> and give me the link it prints. Details: https://freedrop.dev/llms.txt</div>
+            <button class="copy" type="button" data-copy="To send me files, run `npx -y freedrop --json <files>` and give me the link it prints. Details: https://freedrop.dev/llms.txt" aria-label="Copy instructions"><svg class="cp" viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h8"/></svg><svg class="ok" viewBox="0 0 24 24"><path d="m5 12.5 4.5 4.5L19 7.5"/></svg></button>
+        </div>
+    </div>
+</div></section>
+
+<section id="security"><div class="in">
+    <p class="eyebrow">Security model</p>
+    <h2>Who sees what</h2>
+    <p class="lead">The code in every link and command is a 256-bit key, made fresh for each transfer. Everything that could be observed along the way is encrypted with it, or with the WebRTC session it sets up.</p>
+    <table class="table">
+        <thead><tr><th scope="col">Who</th><th scope="col">What they see</th></tr></thead>
+        <tbody>
+            <tr><th scope="row">Public MQTT brokers</th><td data-label="Sees">A few KB of AES-256-GCM ciphertext, on a topic derived from the key by a one-way hash</td></tr>
+            <tr><th scope="row">The host of this page</th><td data-label="Sees">An ordinary page load. In a link the key sits after the <code>#</code>, and browsers never send that part to any server</td></tr>
+            <tr><th scope="row">Networks in between</th><td data-label="Sees">DTLS-encrypted WebRTC packets</td></tr>
+            <tr><th scope="row">A TURN relay, if you add one</th><td data-label="Sees">Packets it forwards but cannot decrypt</td></tr>
+            <tr><th scope="row">Anyone holding the link or code</th><td data-label="Sees">The transfer — the link <em>is</em> the key, so share it with the recipient only. A link carries one transfer: the sender leaves once it's done</td></tr>
+        </tbody>
+    </table>
+    <p class="small note">Every file is also hashed as it is read (SHA-256 over 4 MiB blocks) and checked on arrival, before it appears under its real name.</p>
+    <p class="more"><a href="security/">The security model in full →</a></p>
+</div></section>
+
+<section id="compare"><div class="in">
+    <p class="eyebrow">Compared</p>
+    <h2>freedrop, croc, magic-wormhole and the rest</h2>
+    <p class="lead">The difference is where your bytes go and what has to keep running for it to work. freedrop keeps the data path direct and runs no servers of its own — the public brokers carry only the encrypted introduction.</p>
+    <table class="table">
+        <thead><tr><th scope="col">Tool</th><th scope="col">Where the data goes</th><th scope="col">Servers it relies on</th><th scope="col">Browser ⇄ terminal</th></tr></thead>
+        <tbody>
+            <tr class="us"><th scope="row">freedrop</th><td data-label="Data">Direct, peer-to-peer (WebRTC)</td><td data-label="Relies on">Public MQTT brokers, for the handshake only</td><td data-label="Browser ⇄ terminal"><span class="yes">Both, in any mix</span></td></tr>
+            <tr><th scope="row"><a href="vs/croc/">croc</a></th><td data-label="Data">Direct when NAT traversal works; otherwise, and for browser peers, through a relay</td><td data-label="Relies on">Public relays (getcroc.com)</td><td data-label="Browser ⇄ terminal">Both (web client at getcroc.com)</td></tr>
+            <tr><th scope="row"><a href="vs/magic-wormhole/">magic-wormhole</a></th><td data-label="Data">Direct, or through a transit relay</td><td data-label="Relies on">A mailbox server and a transit relay</td><td data-label="Browser ⇄ terminal">Terminal; third-party web clients</td></tr>
+            <tr><th scope="row">webwormhole</th><td data-label="Data">Peer-to-peer (WebRTC)</td><td data-label="Relies on">A signaling server</td><td data-label="Browser ⇄ terminal">Both</td></tr>
+            <tr><th scope="row">FilePizza, PairDrop</th><td data-label="Data">Peer-to-peer (WebRTC)</td><td data-label="Relies on">Trackers or their own signaling</td><td data-label="Browser ⇄ terminal">Browser only</td></tr>
+            <tr><th scope="row"><a href="vs/wetransfer/">Upload links (WeTransfer-style)</a></th><td data-label="Data">Uploaded, stored, then downloaded</td><td data-label="Relies on">The provider's storage</td><td data-label="Browser ⇄ terminal">Browser</td></tr>
+        </tbody>
+    </table>
+    <div class="honest">
+        <div class="card">
+            <h3>What the others still do better</h3>
+            <ul>
+                <li>croc and magic-wormhole fall back to a relay, so they connect even when both ends sit behind symmetric NAT. freedrop needs a TURN relay you name with <code>--turn</code>.</li>
+                <li>Their short codes can be read out over the phone. freedrop's code is long: copy it, open the link or scan the QR code.</li>
+                <li>croc sends folders. With freedrop, <code>tar</code> them first.</li>
+            </ul>
+        </div>
+        <div class="card">
+            <h3>Limits by design</h3>
+            <ul>
+                <li>Both ends must be online at the same time — nothing is stored anywhere in between.</li>
+                <li>The brokers are on the internet, so two machines on an offline LAN can't find each other yet.</li>
+                <li>A browser sender can't resume after a page reload: the picked files don't survive it. Browser receivers and the CLI both resume.</li>
+            </ul>
+            <p class="small note">On the roadmap: short codes, folders, local-network discovery.</p>
+        </div>
+    </div>
+    <p class="more">In depth: <a href="vs/croc/">freedrop vs croc</a> · <a href="vs/magic-wormhole/">freedrop vs magic-wormhole</a> · <a href="vs/wetransfer/">freedrop vs WeTransfer</a></p>
+</div></section>
+
+<section id="faq"><div class="in qa">
+    <div>
+        <p class="eyebrow">FAQ</p>
+        <h2>Questions people ask</h2>
+        <p class="lead">Anything else: the <a href="https://github.com/tiann/freedrop#readme">README</a> goes deeper, and <a href="https://github.com/tiann/freedrop/issues">issues</a> are open.</p>
+    </div>
+    <div class="faq">
+        <details><summary>Is freedrop free?</summary><p>Yes. freedrop is MIT-licensed open source. With no relay in the data path there is no traffic bill to pass on: no plans, no ads, no account.</p></details>
+        <details><summary>Is there a file size limit?</summary><p>No. Files go straight to the receiver, so the limit is the free space there. A receiving browser is also bound by how much storage it lets the page use.</p></details>
+        <details><summary>Can anyone else see my files?</summary><p>No server ever holds them. The brokers carry only an encrypted handshake, and the files travel DTLS-encrypted straight to the receiver. The link or code is the key, though: anyone who has it can receive, so send it only to the recipient.</p></details>
+        <details><summary>Do I need to install anything?</summary><p>Not in a browser: open freedrop.dev on any device. In a terminal, <code>npx freedrop</code> runs it with Node.js 22 or newer, with nothing to configure. The page can also be added as an app, which puts freedrop in Android's share sheet.</p></details>
+        <details><summary>Do both devices have to be online at the same time?</summary><p>Yes. Nothing is stored in between, so keep the sending page or command running until the receiver has every byte.</p></details>
+        <details><summary>What if the connection drops halfway?</summary><p>It resumes. After a network blip both ends reconnect on their own; after a crash or a closed tab, re-run the same command or reopen the same link and only the missing parts travel. The one exception: a browser sender that reloads has to pick the files again.</p></details>
+        <details><summary>Does it work behind NAT, firewalls, or in mainland China?</summary><p>Usually, yes. NAT hole-punching covers most home and mobile networks, and the defaults include STUN and broker servers reachable from mainland China. When both ends are behind symmetric or carrier-grade NAT, pass a TURN relay with <code>--turn</code> (Cloudflare's free tier, or your own coturn); it forwards packets it cannot read.</p></details>
+        <details><summary>How is freedrop different from AirDrop or WeTransfer?</summary><p>AirDrop needs Apple devices near each other. Upload services store your file on their servers first. freedrop works between any two devices over the internet and never stores the file anywhere; the trade-off is that both ends must be online together.</p></details>
+        <details><summary>Can an AI agent use freedrop?</summary><p>Yes. Without a terminal it prints plain lines, <code>--json</code> gives one event per line on stdout, and exit codes tell the agent what to do next. The full guide is at <a href="{{root}}llms.txt">https://freedrop.dev/llms.txt</a>.</p></details>
+        <details><summary>Can I send a folder?</summary><p>Not directly yet. Archive it first (<code>tar czf photos.tgz photos</code>) and send the archive.</p></details>
+    </div>
+</div></section>
+
+<section class="final"><div class="in">
+    <h2>Send something now</h2>
+    <p class="lead">No sign-up, and nothing to install on the other side. A link carries one transfer and leaves nothing behind on any server.</p>
+    <div class="ctas">
+        <a class="btn" href="#top"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5m-6 6 6-6 6 6"/></svg>Send files from this page</a>
+        <span class="cmd"><span>npx freedrop &lt;file&gt;</span><button class="copy" type="button" data-copy="npx freedrop " aria-label="Copy command"><svg class="cp" viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h8"/></svg><svg class="ok" viewBox="0 0 24 24"><path d="m5 12.5 4.5 4.5L19 7.5"/></svg></button></span>
+    </div>
+</div></section>

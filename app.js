@@ -84,7 +84,10 @@ const p2pWhy = (peer) => {
     return why ? T.p2pWhy(why) : T.p2pFail;
 };
 
-const zh = (navigator.language || "").toLowerCase().startsWith("zh");
+// the page's language (/ is English, /zh/ Chinese) or, on the receive
+// page, which anyone may be sent a link to, the browser's
+const zh = (document.documentElement.dataset.lang ?? navigator.language ?? "").toLowerCase().startsWith("zh");
+if (!document.documentElement.dataset.lang) document.documentElement.lang = zh ? "zh-Hans" : "en";
 const touch = matchMedia("(pointer: coarse)").matches;
 const T = zh ? {
     tagline: "点对点传文件，不经过任何服务器",
@@ -763,7 +766,7 @@ onmessage = async (e) => {
 
 // ---------------------------------------------------------------------------
 
-$("tagline").textContent = T.tagline;
+if ($("tagline")) $("tagline").textContent = T.tagline;
 $("trust-text").textContent = T.trust;
 // a file dropped anywhere outside the drop zone would otherwise replace
 // the page — and with it a running transfer
@@ -783,6 +786,10 @@ const codeIn = (text) => {
 };
 
 const code = codeIn(location.href);
+// where a link opens: the receive page (data-receive, relative to this
+// page), or this page itself
+const receivePage = new URL(document.documentElement.dataset.receive ?? "", location.href);
+receivePage.search = receivePage.hash = "";
 if (typeof RTCPeerConnection === "undefined") {
     fatal(T.noRtc);
 } else if (code) {
@@ -794,7 +801,8 @@ if (typeof RTCPeerConnection === "undefined") {
 // The service worker (sw.js) makes this an installable app: a shell that
 // starts offline, and Android's share sheet as a way to send. Chrome
 // offers installing from its menu only — surface it while it can.
-addEventListener("load", () => navigator.serviceWorker?.register("./sw.js").catch(() => {}));
+// next to this module, so every page (/, /zh/, /r/) gets the one worker
+addEventListener("load", () => navigator.serviceWorker?.register(new URL("sw.js", import.meta.url)).catch(() => {}));
 let installPrompt = null;
 $("install").textContent = T.install;
 addEventListener("beforeinstallprompt", (e) => {
@@ -878,7 +886,7 @@ function sendMode() {
         const room = await SignalRoom.create({ key, role: "host" })
             .catch(() => { throw new Error(T.brokerFail); });
 
-        const link = `${location.origin}${location.pathname}#${codeStr}`;
+        const link = `${receivePage.href}#${codeStr}`;
         const cmd = `npx freedrop ${codeStr}`;
         // the CLI row's copy button stays text-free: tests (and people)
         // read the code straight out of #link's text
@@ -1315,8 +1323,12 @@ async function scan() {
         const hit = found.map((b) => codeIn(b.rawValue)).find(Boolean);
         if (hit) {
             release();
-            // a reload into the link's own URL: receiving runs exactly as
-            // it does from an opened link, and a retry reloads into it
+            // a load of the link's own URL: receiving runs exactly as it
+            // does from an opened link, and a retry reloads into it
+            if (receivePage.pathname !== location.pathname) {
+                location.assign(`${receivePage.href}#${hit}`);
+                return;
+            }
             location.hash = hit;
             location.reload();
             return;

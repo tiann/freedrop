@@ -6,14 +6,17 @@
 // here: signaling is WebSocket, received files are blob: URLs.
 //
 // Android's share sheet hands files to the installed app as a POST
-// navigation to ./?share-target (manifest share_target). The worker
-// answers with a redirect to the page and holds the files until the page
+// navigation to ./?share-target, or ./zh/?share-target when it was
+// installed from the Chinese page (manifest share_target). The worker
+// answers with a redirect to that page and holds the files until the page
 // asks for them ("share-ready").
 
 const CACHE = "freedrop";
-// every file the page loads — an offline start breaks on the one left out
+// the app's pages and every file they load — an offline start breaks on
+// the one left out
 const SHELL = [
-    "./", "app.js", "signal.mjs", "qr.mjs", "manifest.webmanifest",
+    "./", "zh/", "r/", "app.js", "signal.mjs", "qr.mjs", "site.css",
+    "manifest.webmanifest", "manifest.zh.webmanifest",
     "icons/icon-192.png", "icons/icon-512.png", "icons/maskable-512.png",
     "icons/apple-touch-icon.png", "icons/scan-96.png",
 ];
@@ -35,7 +38,7 @@ self.addEventListener("fetch", (e) => {
     const req = e.request;
     const url = new URL(req.url);
     if (req.method === "POST" && url.searchParams.has("share-target")) {
-        e.respondWith(Response.redirect("./?share-target", 303));
+        e.respondWith(Response.redirect(`${url.pathname}?share-target`, 303));
         // stay alive until the page has the files, or give up after a minute
         e.waitUntil(new Promise((done) => {
             shared = { files: req.formData().then((d) => d.getAll("files"), () => []), done };
@@ -44,7 +47,7 @@ self.addEventListener("fetch", (e) => {
         return;
     }
     if (req.method !== "GET") return;
-    // ./, ./index.html, ./?scan … are all the one page
+    // ./zh/, ./zh/index.html, ./zh/?scan … are all the one page
     const key = url.origin + url.pathname.replace(/\/index\.html$/, "/");
     if (!shell.has(key)) return;
     e.respondWith((async () => {

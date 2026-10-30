@@ -1,0 +1,301 @@
+<!-- The Chinese home page's content, between the shared top bar and footer
+     (site/build.mjs). {{card}} is the app (site/card.html), {{root}} the way
+     back to the site root. The FAQ becomes the page's FAQPage as it is.
+     Keep in step with home.en.html. -->
+<section class="hero" id="top"><div class="in">
+    <div class="hero-grid">
+        <div class="hero-copy">
+            <p class="eyebrow">免费 · 开源 · 无需注册</p>
+            <h1>文件直接传到对方设备</h1>
+            <p class="lead"><strong>freedrop</strong> 在两台设备之间直接传文件，浏览器或终端，收发两端任意搭配。数据经端到端加密的 WebRTC 点对点传输：不上传，不留存，也不限大小。</p>
+        </div>
+        <div class="hero-app">
+{{card}}
+        </div>
+        <div class="hero-more">
+            <p class="small">也可以在终端里发（需要 Node.js 22+）：</p>
+            <span class="cmd"><span>npx freedrop video.mp4</span><button class="copy" type="button" data-copy="npx freedrop video.mp4" aria-label="复制命令"><svg class="cp" viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h8"/></svg><svg class="ok" viewBox="0 0 24 24"><path d="m5 12.5 4.5 4.5L19 7.5"/></svg></button></span>
+            <ul class="ticks"><li>任意浏览器和设备</li><li>中断了能续传</li><li>每个字节都校验</li></ul>
+        </div>
+    </div>
+    <dl class="stats">
+        <div><dt>0 字节</dt><dd>文件内容存到服务器上的量</dd></div>
+        <div><dt>256 位</dt><dd>密钥，每次传输重新生成</dd></div>
+        <div><dt>~430 MB/s</dt><dd>CLI 对 CLI，本机回环实测</dd></div>
+        <div><dt>SHA-256</dt><dd>按 4 MiB 分块逐块校验</dd></div>
+    </dl>
+</div></section>
+
+<section id="how"><div class="in">
+    <p class="eyebrow">工作原理</p>
+    <h2>中间只有一次握手</h2>
+    <p class="lead">两台设备只要知道怎么找到对方，就能直接通信。freedrop 只借公共 MQTT 服务器转交这段加密的“自我介绍”，之后就不再经过它。</p>
+    <figure class="diagram">
+        <svg class="wide" viewBox="0 0 760 280" role="img" aria-label="文件经 WebRTC 在两台设备之间直接传输；公共 MQTT 服务器只转交几 KB 的加密握手信息。">
+            <path class="dg-hand" d="M150 178C150 112 176 62 215 62"/>
+            <path class="dg-hand" d="M610 178C610 112 584 62 545 62"/>
+            <rect class="dg-broker" x="215" y="22" width="330" height="80" rx="14"/>
+            <text class="dg-t" x="380" y="56" text-anchor="middle">公共 MQTT 服务器</text>
+            <text class="dg-s" x="380" y="78" text-anchor="middle">只转交握手：几 KB，已加密</text>
+            <rect class="dg-node" x="40" y="178" width="220" height="84" rx="16"/>
+            <circle class="dg-dot" cx="80" cy="220" r="20"/>
+            <path class="dg-arrow" d="M80 228V212m-6 6 6-6 6 6"/>
+            <text class="dg-t" x="112" y="214">发送方</text>
+            <text class="dg-s" x="112" y="236">浏览器或终端</text>
+            <rect class="dg-node" x="500" y="178" width="220" height="84" rx="16"/>
+            <circle class="dg-dot" cx="540" cy="220" r="20"/>
+            <path class="dg-arrow" d="M540 212v16m-6-6 6 6 6-6"/>
+            <text class="dg-t" x="572" y="214">接收方</text>
+            <text class="dg-s" x="572" y="236">浏览器或终端</text>
+            <line class="dg-pipe" x1="272" y1="220" x2="488" y2="220"/>
+            <line class="dg-flow" x1="272" y1="220" x2="488" y2="220"/>
+            <text class="dg-a" x="380" y="202" text-anchor="middle">你的文件</text>
+            <text class="dg-s" x="380" y="250" text-anchor="middle">WebRTC 直连 · DTLS 加密</text>
+        </svg>
+        <svg class="tall" viewBox="0 0 360 430" role="img" aria-label="文件经 WebRTC 在两台设备之间直接传输；公共 MQTT 服务器只转交几 KB 的加密握手信息。">
+            <path class="dg-hand" d="M215 48C266 48 290 110 290 168"/>
+            <path class="dg-hand" d="M215 382C266 382 290 320 290 262"/>
+            <rect class="dg-broker" x="226" y="168" width="128" height="94" rx="14"/>
+            <text class="dg-t" x="290" y="203" text-anchor="middle">MQTT 服务器</text>
+            <text class="dg-s" x="290" y="225" text-anchor="middle">只转交握手</text>
+            <text class="dg-s" x="290" y="243" text-anchor="middle">已加密</text>
+            <rect class="dg-node" x="10" y="10" width="205" height="76" rx="16"/>
+            <circle class="dg-dot" cx="48" cy="48" r="20"/>
+            <path class="dg-arrow" d="M48 56V40m-6 6 6-6 6 6"/>
+            <text class="dg-t" x="80" y="43">发送方</text>
+            <text class="dg-s" x="80" y="65">浏览器或终端</text>
+            <rect class="dg-node" x="10" y="344" width="205" height="76" rx="16"/>
+            <circle class="dg-dot" cx="48" cy="382" r="20"/>
+            <path class="dg-arrow" d="M48 374v16m-6-6 6 6 6-6"/>
+            <text class="dg-t" x="80" y="377">接收方</text>
+            <text class="dg-s" x="80" y="399">浏览器或终端</text>
+            <line class="dg-pipe" x1="112" y1="98" x2="112" y2="332"/>
+            <line class="dg-flow" x1="112" y1="98" x2="112" y2="332"/>
+            <text class="dg-a" x="128" y="208">你的文件</text>
+            <text class="dg-s" x="128" y="228">直连 · DTLS</text>
+        </svg>
+    </figure>
+    <ol class="steps">
+        <li><h3>选文件</h3>freedrop 为这次传输生成一个全新的 256 位密钥，并以三种形式给出：链接、二维码，和一行 <code>npx freedrop &lt;code&gt;</code> 命令。</li>
+        <li><h3>碰头</h3>双方从密钥推导出同一个房间，经公共 MQTT 服务器交换几 KB 的 WebRTC 握手信息，全程 AES-256-GCM 加密。服务器只能看到一个随机话题上的密文。</li>
+        <li><h3>传输</h3>NAT 打洞之后，文件经 WebRTC 数据通道从一台设备直达另一台，DTLS 端到端加密。速度取决于两台设备之间的网络路径。</li>
+    </ol>
+    <p class="more"><a href="security/">一步步看它怎么工作 →</a></p>
+</div></section>
+
+<section id="anywhere"><div class="in">
+    <p class="eyebrow">任意设备，任意一端</p>
+    <h2>浏览器还是终端，收发都行</h2>
+    <p class="lead">四种组合都能用。接收方什么都不用装：链接在手机或电脑的任意浏览器里都能打开。</p>
+    <div class="grid two">
+        <div class="card">
+            <div class="pair" aria-hidden="true"><span><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M3 9h18M7 6.5h.01M10 6.5h.01"/></svg></span><i></i><span><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M3 9h18M7 6.5h.01M10 6.5h.01"/></svg></span></div>
+            <h3>浏览器 → 浏览器</h3>
+            <p>在网页上选好文件，把链接发给对方，或者让对方扫二维码。</p>
+        </div>
+        <div class="card">
+            <div class="pair" aria-hidden="true"><span><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M3 9h18M7 6.5h.01M10 6.5h.01"/></svg></span><i></i><span><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="m7.5 10 3 2.5-3 2.5M13 15h4"/></svg></span></div>
+            <h3>浏览器 → 终端</h3>
+            <p>网页上还会显示一行 <code>npx freedrop &lt;code&gt;</code>，在另一台机器上运行即可；直接粘贴链接也行，命令两种都认。</p>
+        </div>
+        <div class="card">
+            <div class="pair" aria-hidden="true"><span><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="m7.5 10 3 2.5-3 2.5M13 15h4"/></svg></span><i></i><span><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M3 9h18M7 6.5h.01M10 6.5h.01"/></svg></span></div>
+            <h3>终端 → 浏览器</h3>
+            <p><code>npx freedrop report.pdf</code> 会打印链接和二维码。用手机一扫，文件直接在手机上下载。</p>
+        </div>
+        <div class="card">
+            <div class="pair" aria-hidden="true"><span><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="m7.5 10 3 2.5-3 2.5M13 15h4"/></svg></span><i></i><span><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="m7.5 10 3 2.5-3 2.5M13 15h4"/></svg></span></div>
+            <h3>终端 → 终端</h3>
+            <p>在另一台机器上运行打印出来的 <code>npx freedrop &lt;code&gt;</code>。不用配 SSH 密钥，不用端口转发，也不用共享网盘。</p>
+        </div>
+    </div>
+</div></section>
+
+<section id="features"><div class="in">
+    <p class="eyebrow">你能得到什么</p>
+    <h2>大文件也放心交给它</h2>
+    <div class="grid">
+        <div class="card">
+            <div class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 8h15m-4-4 4 4-4 4M20 16H5m4-4-4 4 4 4"/></svg></div>
+            <h3>数据不经过服务器</h3>
+            <p>字节从设备直达设备。文件不会停在服务器上等对方来取，也没有中转服务器替你付流量——或者看你的流量。</p>
+        </div>
+        <div class="card">
+            <div class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg></div>
+            <h3>端到端加密</h3>
+            <p>传输用 DTLS，握手用 AES-256-GCM。链接里的密钥放在 URL 的 <code>#</code> 后面，浏览器从不把这部分发给任何服务器，本站也收不到。</p>
+        </div>
+        <div class="card">
+            <div class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 12c-2-2.67-4-4-6-4a4 4 0 0 0 0 8c2 0 4-1.33 6-4Zm0 0c2 2.67 4 4 6 4a4 4 0 0 0 0-8c-2 0-4 1.33-6 4Z"/></svg></div>
+            <h3>不限大小，无需注册</h3>
+            <p>没有注册，没有配额，没有过期时间。唯一的限制是接收方的剩余空间。</p>
+        </div>
+        <div class="card">
+            <div class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12a9 9 0 0 1 15.5-6.2L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-15.5 6.2L3 16"/><path d="M3 21v-5h5"/></svg></div>
+            <h3>断点续传</h3>
+            <p>Wi-Fi 断了、合上了笔记本、进程被杀：重新运行命令或重新打开链接，只补传缺失的部分。</p>
+        </div>
+        <div class="card">
+            <div class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 4.5 6v5.5c0 4.6 3.2 8.4 7.5 9.5 4.3-1.1 7.5-4.9 7.5-9.5V6Z"/><path d="m9 12 2 2 4-4"/></svg></div>
+            <h3>每个文件都校验</h3>
+            <p>按 4 MiB 分块做 SHA-256，校验通过才以真实文件名出现。发送途中源文件被改动会明确报错，不会悄悄落下一个损坏的文件。</p>
+        </div>
+        <div class="card">
+            <div class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M13 2 4 14h7l-1 8 9-12h-7Z"/></svg></div>
+            <h3>该快的地方够快</h3>
+            <p>CLI 用原生 WebRTC：本机回环 CLI 对 CLI 约 430 MB/s。超过 64 MB 的传输拆到四条连接上并行，小文件一个接一个流水线发送。</p>
+        </div>
+        <div class="card">
+            <div class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 8V6a2 2 0 0 1 2-2h2m8 0h2a2 2 0 0 1 2 2v2m0 8v2a2 2 0 0 1-2 2h-2m-8 0H6a2 2 0 0 1-2-2v-2M4 12h16"/></svg></div>
+            <h3>扫码接收</h3>
+            <p>手机对准发送方的二维码，传输直接在页面里打开。添加到主屏幕后，freedrop 会出现在 Android 的分享菜单里。</p>
+        </div>
+        <div class="card">
+            <div class="ico"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="8" width="16" height="12" rx="3"/><path d="M12 8V4.5M9 13.5v1M15 13.5v1M2 14h2M20 14h2"/></svg></div>
+            <h3>适合脚本和 Agent</h3>
+            <p>没有终端时不弹提示、不刷屏，<code>--json</code> 把事件逐行输出到 stdout，退出码直接说明下一步该做什么。</p>
+        </div>
+    </div>
+</div></section>
+
+<section id="uses"><div class="in">
+    <p class="eyebrow">适用场景</p>
+    <h2>那些以前很别扭的传输</h2>
+    <div class="grid two">
+        <div class="card">
+            <h3>从服务器传到手机</h3>
+            <p>在 SSH 会话里发送文件，终端会打印一个二维码；手机一扫，文件就在手机浏览器里开始下载。</p>
+            <pre class="term"><span class="p">$ </span>npx freedrop build/app-release.apk</pre>
+        </div>
+        <div class="card">
+            <h3>两台电脑，网络不限</h3>
+            <p>家里、公司、云服务器，不同网络、不同 NAT 都没关系。在另一端运行发送方打印的命令即可。</p>
+            <pre class="term"><span class="p">$ </span>npx freedrop dataset.tar
+<span class="d"># 在另一台机器上</span>
+<span class="p">$ </span>npx freedrop uMDpiKrcHEIabTuxSCnCUOTdLoMs4DRLGP0lPmC8gVA</pre>
+        </div>
+        <div class="card">
+            <h3>发给从没用过它的人</h3>
+            <p>把链接发过去，对方用手边任何浏览器打开、保存文件：不装应用，不用注册，不用解释。</p>
+            <pre class="term">https://freedrop.dev/#uMDpiKrcHEIabTuxSCnCUOTdLoMs4DRLGP0lPmC8gVA</pre>
+        </div>
+        <div class="card">
+            <h3>从 AI Agent 的沙箱里取文件</h3>
+            <p>远程机器或容器里的编程 Agent 把产出发给你，你拿到的只是一个链接。<a href="#agents">下面细说。</a></p>
+            <pre class="term"><span class="p">$ </span>npx -y freedrop --json --timeout 10m report.pdf</pre>
+        </div>
+    </div>
+    <p class="more"><a href="cli/">更多终端用法：SSH、服务器、中断续传 →</a></p>
+</div></section>
+
+<section class="band" id="agents"><div class="in split">
+    <div>
+        <p class="eyebrow">给 AI Agent</p>
+        <h2>让 Agent 直接把文件交给你</h2>
+        <p class="lead">编程 Agent 跑在沙箱、容器和远程机器里——你的下载文件夹够不着的地方。有了 freedrop，Agent 运行一条命令、把链接交给你，等你收齐每个字节后自行退出。反过来也行：你在手机上选文件，Agent 来接收。</p>
+        <ul class="checks">
+            <li><strong>没有终端也不卡住。</strong>只输出纯文本行，不打二维码、不刷新进度条；接收方没加 <code>-y</code> 会直接退出，而不是等一个没人回答的确认。</li>
+            <li><strong>每行一个 JSON 事件：</strong>加 <code>--json</code> 后输出 <code>ready</code>、<code>progress</code>、<code>saved</code>、<code>done</code>、<code>error</code>。</li>
+            <li><strong>退出码说明下一步：</strong><code>8</code> 重跑即续传，<code>4</code> 加 TURN 中继重试，<code>7</code> 超时。</li>
+            <li><strong>专为 Agent 写的说明：</strong><a href="{{root}}llms.txt">freedrop.dev/llms.txt</a></li>
+        </ul>
+        <p class="more"><a href="agents/">给 Agent 的完整说明 →</a></p>
+    </div>
+    <div>
+        <pre class="term"><span class="p">$ </span>npx -y freedrop --json --timeout 10m report.pdf
+{"event":"ready","code":"uMDpiKrc…","link":"https://freedrop.dev/#uMDpiKrc…","files":[{"name":"report.pdf","size":482113}],"total":482113}
+<span class="d"># Agent 把链接交给你，你打开它</span>
+{"event":"progress","bytes":482113,"total":482113}
+{"event":"done","total":482113,"seconds":1.8}
+<span class="p">$ </span>echo $?
+0</pre>
+        <div class="snippet">
+            <div><small>粘贴到 Agent 的指令里</small>要给我发文件时，运行 <code>npx -y freedrop --json &lt;文件&gt;</code>，然后把它打印的链接给我。详见 https://freedrop.dev/llms.txt</div>
+            <button class="copy" type="button" data-copy="要给我发文件时，运行 `npx -y freedrop --json <文件>`，然后把它打印的链接给我。详见 https://freedrop.dev/llms.txt" aria-label="复制指令"><svg class="cp" viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h8"/></svg><svg class="ok" viewBox="0 0 24 24"><path d="m5 12.5 4.5 4.5L19 7.5"/></svg></button>
+        </div>
+    </div>
+</div></section>
+
+<section id="security"><div class="in">
+    <p class="eyebrow">安全模型</p>
+    <h2>谁能看到什么</h2>
+    <p class="lead">每个链接和命令里的那串代码，就是这次传输专用的 256 位密钥。路上任何可能被看到的东西，都由它、或由它建立的 WebRTC 会话加密。</p>
+    <table class="table">
+        <thead><tr><th scope="col">谁</th><th scope="col">能看到什么</th></tr></thead>
+        <tbody>
+            <tr><th scope="row">公共 MQTT 服务器</th><td data-label="能看到">几 KB 的 AES-256-GCM 密文，发在一个由密钥单向哈希得出的话题上</td></tr>
+            <tr><th scope="row">本站的托管方</th><td data-label="能看到">一次普通的页面加载。链接里的密钥在 <code>#</code> 后面，浏览器从不把这部分发给任何服务器</td></tr>
+            <tr><th scope="row">途经的网络</th><td data-label="能看到">DTLS 加密的 WebRTC 数据包</td></tr>
+            <tr><th scope="row">TURN 中继（仅当你自己加了）</th><td data-label="能看到">它负责转发、但解不开的数据包</td></tr>
+            <tr><th scope="row">拿到链接或代码的任何人</th><td data-label="能看到">这次传输本身——链接就是密钥，只发给接收方。一个链接只对应一次传输，传完发送方就离开</td></tr>
+        </tbody>
+    </table>
+    <p class="small note">每个文件在读取时还会做哈希（按 4 MiB 分块 SHA-256），到达后先校验，通过才以真实文件名出现。</p>
+    <p class="more"><a href="security/">完整的安全模型 →</a></p>
+</div></section>
+
+<section id="compare"><div class="in">
+    <p class="eyebrow">对比</p>
+    <h2>freedrop、croc、magic-wormhole 及其他</h2>
+    <p class="lead">区别在于：你的数据走哪条路，以及要有什么一直在线它才能工作。freedrop 让数据直连，自己不运营任何服务器——公共 MQTT 服务器只转交加密的“自我介绍”。</p>
+    <table class="table">
+        <thead><tr><th scope="col">工具</th><th scope="col">数据走向</th><th scope="col">依赖的服务器</th><th scope="col">浏览器 ⇄ 终端</th></tr></thead>
+        <tbody>
+            <tr class="us"><th scope="row">freedrop</th><td data-label="数据">点对点直连（WebRTC）</td><td data-label="依赖">公共 MQTT 服务器，仅用于握手</td><td data-label="浏览器 ⇄ 终端"><span class="yes">都支持，任意组合</span></td></tr>
+            <tr><th scope="row"><a href="vs/croc/">croc</a></th><td data-label="数据">NAT 穿透成功时直连；否则（以及浏览器一端）经中继</td><td data-label="依赖">公共中继（getcroc.com）</td><td data-label="浏览器 ⇄ 终端">都支持（网页端 getcroc.com）</td></tr>
+            <tr><th scope="row"><a href="vs/magic-wormhole/">magic-wormhole</a></th><td data-label="数据">直连，或经 transit 中继</td><td data-label="依赖">mailbox 服务器和 transit 中继</td><td data-label="浏览器 ⇄ 终端">终端；另有第三方网页客户端</td></tr>
+            <tr><th scope="row">webwormhole</th><td data-label="数据">点对点（WebRTC）</td><td data-label="依赖">信令服务器</td><td data-label="浏览器 ⇄ 终端">都支持</td></tr>
+            <tr><th scope="row">FilePizza、PairDrop</th><td data-label="数据">点对点（WebRTC）</td><td data-label="依赖">Tracker 或自有信令</td><td data-label="浏览器 ⇄ 终端">仅浏览器</td></tr>
+            <tr><th scope="row"><a href="vs/wetransfer/">网盘式上传链接（WeTransfer 等）</a></th><td data-label="数据">先上传、存储，再下载</td><td data-label="依赖">服务商的存储</td><td data-label="浏览器 ⇄ 终端">浏览器</td></tr>
+        </tbody>
+    </table>
+    <div class="honest">
+        <div class="card">
+            <h3>其他工具做得更好的地方</h3>
+            <ul>
+                <li>croc 和 magic-wormhole 有中继兜底，两端都在对称型 NAT 后面也能连上；freedrop 需要你用 <code>--turn</code> 指定一个 TURN 中继。</li>
+                <li>它们的短口令可以电话里念给对方；freedrop 的代码很长，只能复制、点链接或扫码。</li>
+                <li>croc 能直接发文件夹；用 freedrop 请先用 <code>tar</code> 打包。</li>
+            </ul>
+        </div>
+        <div class="card">
+            <h3>设计上的限制</h3>
+            <ul>
+                <li>两端必须同时在线——中间不存任何东西。</li>
+                <li>MQTT 服务器在互联网上，所以离线局域网里的两台机器暂时找不到彼此。</li>
+                <li>浏览器作为发送方时，刷新页面后无法续传（选好的文件不会保留）；浏览器接收方和 CLI 都能续传。</li>
+            </ul>
+            <p class="small note">计划中：短口令、文件夹、局域网发现。</p>
+        </div>
+    </div>
+    <p class="more">详细对比：<a href="vs/croc/">freedrop 与 croc</a> · <a href="vs/magic-wormhole/">freedrop 与 magic-wormhole</a> · <a href="vs/wetransfer/">freedrop 与 WeTransfer</a></p>
+</div></section>
+
+<section id="faq"><div class="in qa">
+    <div>
+        <p class="eyebrow">常见问题</p>
+        <h2>大家常问的</h2>
+        <p class="lead">还有疑问？<a href="https://github.com/tiann/freedrop#readme">README</a> 讲得更细，也欢迎提 <a href="https://github.com/tiann/freedrop/issues">issue</a>。</p>
+    </div>
+    <div class="faq">
+        <details><summary>freedrop 免费吗？</summary><p>免费。freedrop 以 MIT 协议开源。数据不经过中继，也就没有流量费用要转嫁给你：没有套餐，没有广告，不用注册。</p></details>
+        <details><summary>文件大小有限制吗？</summary><p>没有。文件直接写到接收方，上限就是那边的剩余空间。用浏览器接收时，还受浏览器分配给网页的存储空间限制。</p></details>
+        <details><summary>别人能看到我的文件吗？</summary><p>没有任何服务器经手你的文件。MQTT 服务器只转交加密的握手信息，文件经 DTLS 加密直达接收方。不过链接或代码本身就是密钥：拿到它的人都能接收，所以只发给接收方。</p></details>
+        <details><summary>需要安装什么吗？</summary><p>用浏览器不需要：在任意设备上打开 freedrop.dev 即可。终端里运行 <code>npx freedrop</code>，需要 Node.js 22 及以上，无需配置。网页也可以添加为应用，添加后 freedrop 会出现在 Android 的分享菜单里。</p></details>
+        <details><summary>两台设备必须同时在线吗？</summary><p>是的。中间不存储任何东西，所以在接收方收齐之前，请保持发送页面或命令运行。</p></details>
+        <details><summary>传到一半断了怎么办？</summary><p>会续传。网络抖动后两端自动重连；进程崩溃或关掉了标签页，重新运行同一条命令或重新打开同一个链接，只补传缺失的部分。唯一的例外：浏览器发送方刷新页面后，需要重新选择文件。</p></details>
+        <details><summary>国内能用吗？在 NAT 和防火墙后面呢？</summary><p>通常可以。NAT 打洞能覆盖大多数家庭和移动网络，默认配置里也包含中国大陆可以直连的 STUN 服务器和 MQTT 服务器。如果两端都在对称型 NAT 或运营商级 NAT（CGNAT）后面，可以用 <code>--turn</code> 加一个 TURN 中继（Cloudflare 的免费额度，或自建 coturn），中继只转发它解不开的数据包。</p></details>
+        <details><summary>和 AirDrop、网盘、聊天软件传文件有什么不同？</summary><p>AirDrop 要求两台苹果设备就在附近；网盘和聊天软件要先把文件上传到它们的服务器。freedrop 在任意两台联网设备之间直接传，文件不会存到任何地方；代价是两端必须同时在线。</p></details>
+        <details><summary>AI Agent 能用 freedrop 吗？</summary><p>能。没有终端时它只输出纯文本行；加 <code>--json</code> 后在 stdout 上逐行输出事件；退出码告诉 Agent 下一步该怎么做。完整说明见 <a href="{{root}}llms.txt">https://freedrop.dev/llms.txt</a>。</p></details>
+        <details><summary>能发文件夹吗？</summary><p>暂时不能直接发。先打包（<code>tar czf photos.tgz photos</code>），再发送压缩包。</p></details>
+    </div>
+</div></section>
+
+<section class="final"><div class="in">
+    <h2>现在就发一个试试</h2>
+    <p class="lead">不用注册，接收方也不用装任何东西。一个链接只对应一次传输，不在任何服务器上留下东西。</p>
+    <div class="ctas">
+        <a class="btn" href="#top"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5m-6 6 6-6 6 6"/></svg>打开 freedrop 发送文件</a>
+        <span class="cmd"><span>npx freedrop &lt;文件&gt;</span><button class="copy" type="button" data-copy="npx freedrop " aria-label="复制命令"><svg class="cp" viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h8"/></svg><svg class="ok" viewBox="0 0 24 24"><path d="m5 12.5 4.5 4.5L19 7.5"/></svg></button></span>
+    </div>
+</div></section>

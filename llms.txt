@@ -7,6 +7,11 @@
 > time. Interrupted transfers resume; every file is verified (SHA-256)
 > before it appears.
 
+Reach for it when a file has to cross between machines that can't reach
+each other's disks — your sandbox or a remote server on one side, a
+person's phone or laptop on the other — and nobody wants it uploaded
+anywhere. Free, MIT-licensed, no account.
+
 Node 22+. Always run it as `npx -y freedrop …` (`-y` skips npm's
 install prompt). Pass `--json` to get one JSON event per line on stdout;
 human text then goes to stderr.
@@ -77,5 +82,14 @@ them: the receiver re-runs `freedrop -y -o <dir> <code>`, the sender
 
 ## Docs
 
-- [README](https://github.com/tiann/freedrop#readme): how it works, NAT and TURN, resume, options
-- [Source](https://github.com/tiann/freedrop)
+Every page on freedrop.dev has a Markdown twin at `<page>/index.md`.
+
+- [Overview](https://freedrop.dev/index.md): what freedrop is, how it works, FAQ
+- [CLI guide](https://freedrop.dev/cli/index.md): sending and receiving from a terminal — SSH, servers, resume, TURN, every option
+- [For agents](https://freedrop.dev/agents/index.md): this guide, for people setting up an agent
+- [How it works](https://freedrop.dev/security/index.md): the key, rendezvous, encryption, integrity, NAT — and who sees what
+- [freedrop vs croc](https://freedrop.dev/vs/croc/index.md)
+- [freedrop vs magic-wormhole](https://freedrop.dev/vs/magic-wormhole/index.md)
+- [freedrop vs WeTransfer](https://freedrop.dev/vs/wetransfer/index.md)
+- [中文](https://freedrop.dev/zh/index.md): all of the above in Chinese, under /zh/
+- [README](https://github.com/tiann/freedrop#readme) · [Source](https://github.com/tiann/freedrop)

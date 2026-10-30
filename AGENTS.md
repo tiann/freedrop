@@ -9,7 +9,12 @@ code won't tell you at a glance.
 | File | Role |
 |---|---|
 | `cli.mjs` | the whole Node CLI: arg parsing, WebRTC engine choice, send, receive, staging and landing |
-| `app.js`, `index.html` | the web client — a static page, no build step |
+| `app.js` | the web client: the whole app, run as is (no bundling) on every page that carries the card |
+| `site/build.mjs` | builds freedrop.dev into `_site/`: the app's pages, the content pages, a Markdown twin of each, sitemap, 404 — zero dependencies |
+| `site/card.html`, `site/app.css` | the app card's markup and styles, put into `/`, `/zh/` and `/r/` |
+| `site/home.{en,zh}.html` | the two home pages' content around the card (`/`, `/zh/`) |
+| `site/pages/{en,zh}/**/*.md` | content pages (`/cli/`, `/agents/`, `/security/`, `/vs/*/` and `/zh/…`), in the Markdown dialect `build.mjs` documents |
+| `site/site.css`, `site/robots.txt`, `icons/og.png` | site styles, crawler rules, the social preview image |
 | `signal.mjs` | rendezvous over MQTT (encrypted room, SDP/ICE exchange), used by both CLI and page |
 | `lock.mjs` | directory lease lock guarding the CLI receiver's staging directory |
 | `qr.mjs` | dependency-free QR encoder for the page |
@@ -17,13 +22,16 @@ code won't tell you at a glance.
 | `test/` | `node --test` suites; `helpers.mjs` spawns real CLI processes |
 | `llms.txt` | usage guide for AI agents, served at freedrop.dev/llms.txt |
 
-`.github/workflows/pages.yml` publishes the **entire repository root** to
-freedrop.dev on every push to `main` — anything committed is public on the
-site.
+`.github/workflows/pages.yml` runs `node site/build.mjs _site` and
+publishes `_site/` to freedrop.dev on every push to `main`. Only what the
+build puts there is public: its `COPY` list names the app's files.
 
 ## Commands
 
-- `npm test` — lock, CLI⇆CLI and QR suites. Real WebRTC over loopback,
+- `npm run build` — the site into `_site/` (`node site/build.mjs <dir>`
+  for elsewhere); serve that directory to try it. The tests build their
+  own copy.
+- `npm test` — lock, CLI⇆CLI, QR and site suites. Real WebRTC over loopback,
   SIGKILL-driven resume scenarios; takes minutes, not seconds.
 - `npm run test:browser` — Playwright. Run `npx playwright install chromium`
   once, or set `FREEDROP_TEST_CHROMIUM` to a Chromium / headless-shell binary.
@@ -32,7 +40,7 @@ site.
   a hermetic run, point `FREEDROP_TEST_BROKER` at a local `ws://` MQTT
   broker — CI runs mosquitto with a websockets listener
   (`.github/workflows/test.yml`).
-- No build, linter or type checker. Node 22+.
+- No linter or type checker; the only build is the site's. Node 22+.
 
 ## Environment hooks
 
@@ -43,7 +51,7 @@ site.
 | `FREEDROP_BPS` | sender rate cap in bytes/s — gives kill-mid-transfer tests a deterministic window |
 | `FREEDROP_RTC=js` | force the werift (pure JS) engine instead of node-datachannel |
 | `FREEDROP_DEBUG` | `[dbg]` / `[rtc:…]` logging to stderr |
-| `FREEDROP_PAGE` | base URL of the links the CLI prints (default `https://freedrop.dev/`) |
+| `FREEDROP_PAGE` | base URL of the links the CLI prints (default `https://freedrop.dev/r/`) |
 | `FREEDROP_STUN` | comma-separated `stun:` URLs replacing the CLI's list — tests point it at `startStun()` stand-ins that play a scripted NAT |
 | `FREEDROP_ICE_POLICY=relay` | relay-only ICE: set on both ends and without `--turn`, the peers meet but can't connect — the exit-4 path, on loopback |
 
@@ -79,11 +87,35 @@ site.
   Plausible-looking changes here have failed under multi-process stress
   before; a change needs an adversarial test in the style of
   `test/lock.test.mjs`.
-- **`SHELL` in `sw.js` lists every file the page loads.** A file left
+- **`SHELL` in `sw.js` lists the app's pages and every file they load.** A file left
   out still works online and is missing only from an offline start (the
   browser tests catch a missing module, not a missing icon). A listed
   file that doesn't exist fails the worker's install, and the page
   silently stops being installable — the tests catch that.
+- **Links open on `/r/`, nowhere else.** The page builds them from
+  `data-receive` on `<html>` (relative, so any host works), the CLI from
+  `FREEDROP_PAGE`; scanning a code navigates there. The home pages send
+  an old `/#<code>` link on to `r/#<code>` before anything renders —
+  links from older CLIs depend on it.
+- **The app's language is the page's.** `data-lang` on `<html>` (`/`
+  English, `/zh/` Chinese) wins; only `/r/`, which anyone may be sent,
+  follows `navigator.language`. The installed app gets the same split
+  through `manifest.zh.webmanifest`, which the build derives from
+  `manifest.webmanifest` (same `id`, start and share target under
+  `./zh/`).
+- **The site is what crawlers see** — most AI crawlers run no
+  JavaScript, so every page must read fully without it. English and
+  Chinese pages come in pairs with the same sections and facts; the
+  home pages' `FAQPage` is generated from their visible FAQ, and each
+  page's Markdown twin from its source. `test/site.test.mjs` checks
+  pairs, canonicals, descriptions, hreflang, links and anchors. The
+  pages' numbers and limits (speed, crypto, NAT, resume) restate the
+  README — change them together; the agents page includes `llms.txt`'s
+  reference sections rather than repeating them.
+- **The home pages share the app's DOM.** A `<button>` in their content
+  must not be named like the app's (Save, Scan, Cancel, Install — the
+  browser tests find those by name); the installed app shows only the
+  card (`display-mode: standalone` in `site.css`).
 - **The service worker hides requests from `page.route`.** Once a page
   is controlled (from its second load on), Playwright's `page.route`
   no longer sees its fetches — route only a context's first visit, as
@@ -129,6 +161,7 @@ Web page — `test/browser.test.mjs` reads state from the DOM:
 - the installed app's ways in: a multipart POST of `files` to
   `./?share-target` starts sending them, `./?scan` opens the scanner;
   both leave the URL at `./`. `#install` shows on `beforeinstallprompt`
+- receiving happens on `/r/#<code>`; the sender's `#link` shows that URL
 
 ## Releasing
 

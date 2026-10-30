@@ -1,0 +1,24 @@
+<div id="card">
+    <button id="drop" type="button" hidden>
+        <span class="glyph"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 15V4m-4.5 4.5L12 4l4.5 4.5"/><path d="M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/></svg></span>
+        <strong id="drop-title"></strong>
+        <span id="drop-hint"></span>
+    </button>
+    <button id="scan" class="ghost" type="button" hidden>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 8V6a2 2 0 0 1 2-2h2m8 0h2a2 2 0 0 1 2 2v2m0 8v2a2 2 0 0 1-2 2h-2m-8 0H6a2 2 0 0 1-2-2v-2M4 12h16"/></svg>
+        <span id="scan-label"></span>
+    </button>
+    <div id="viewfinder" hidden><video muted playsinline></video></div>
+    <input id="picker" type="file" multiple hidden>
+    <div id="summary" hidden><span id="count"></span></div>
+    <ul id="files" hidden></ul>
+    <div id="link" hidden></div>
+    <div id="progress" hidden>
+        <div class="row"><div id="status"></div><span id="pct"></span></div>
+        <div id="bar" hidden><div></div></div>
+        <div id="meta" class="row" hidden><span id="amount"></span><span id="rate"></span></div>
+    </div>
+    <p id="hint" hidden></p>
+    <div id="actions" hidden></div>
+    <div id="trust"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg><span id="trust-text">{{trust}}</span></div>
+</div>

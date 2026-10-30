@@ -31,7 +31,7 @@ import qrcode from "qrcode-terminal";
 import { SignalRoom, IceInbox, b64u, DEFAULT_BROKERS } from "./signal.mjs";
 import { acquireLeaseLock } from "./lock.mjs";
 
-const PAGE = process.env.FREEDROP_PAGE ?? "https://freedrop.dev/";
+const PAGE = process.env.FREEDROP_PAGE ?? "https://freedrop.dev/r/";
 
 // FREEDROP_STUN (comma-separated stun: URLs) replaces the list — the
 // tests point it at local stand-ins that play a scripted NAT

@@ -22,10 +22,12 @@ Every combination works:
 | **sender: CLI** | `npx freedrop <code>` | open the link / scan the QR |
 | **sender: browser** | `npx freedrop <code>` | open the link / scan the QR |
 
-The web client is a static page (this repo, deployed to
-[freedrop.dev](https://freedrop.dev/)) — host it anywhere, or open it
-locally. Where the browser can read QR codes itself (Chrome on Android,
-macOS and ChromeOS), the page has a **Scan to receive** button: point it at
+The web client is a static site: `npm run build` (no dependencies)
+assembles it from `site/` and the app's own files into `_site/`, which is
+what [freedrop.dev](https://freedrop.dev/) serves — host that directory
+anywhere. Links open on its receive page, `/r/#<code>`. Where the browser
+can read QR codes itself (Chrome on Android, macOS and ChromeOS), the page
+has a **Scan to receive** button: point it at
 the sender's QR code and the transfer opens right there, no camera-app
 detour. A finished transfer offers the same button, so a phone can take one
 transfer after another without going back to the start page. A link
@@ -53,7 +55,7 @@ transfer:
    hole-punching, DTLS-encrypted end to end. No relay, no server, no
    size limit; speed is whatever the path between you two allows.
 
-In the browser link (`…/#<code>`) the key rides the URL fragment, which
+In the browser link (`…/r/#<code>`) the key rides the URL fragment, which
 browsers never send to any server — the page host doesn't see it either.
 Integrity comes from the transport (DTLS + SCTP): there is no relay in the
 path that could tamper with or corrupt the bytes.
@@ -129,7 +131,7 @@ a name that is already taken lands as `name(1).ext`.
 npx -y freedrop --json --timeout 10m report.pdf
 
 # receive what someone picked at freedrop.dev, from the link they shared
-npx -y freedrop --json -y -o downloads 'https://freedrop.dev/#…'
+npx -y freedrop --json -y -o downloads 'https://freedrop.dev/r/#…'
 ```
 
 (`npx -y` skips npm's install prompt; the second `-y` is freedrop's.)
@@ -170,8 +172,8 @@ The same guide, written for agents, is served at
 | | data path | needs own infra | CLI⇆browser |
 |---|---|---|---|
 | **freedrop** | P2P (WebRTC) | no — public brokers | ✅ |
-| croc | through a relay | relay (author-funded) | ✗ CLI only |
-| magic-wormhole | direct or relay | project servers | ✗ CLI only |
+| croc | direct, else its relay (always for browser peers) | public relays | ✅ (getcroc.com) |
+| magic-wormhole | direct or relay | mailbox + transit relay | CLI; third-party web clients |
 | webwormhole | P2P (WebRTC) | signaling server | ✅ |
 | FilePizza / PairDrop | P2P (WebRTC) | trackers / own signaling | ✗ browser only |
 

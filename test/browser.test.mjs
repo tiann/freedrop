@@ -14,6 +14,7 @@ import { createServer } from "node:http";
 import { randomBytes, createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
+import { build } from "../site/build.mjs";
 import {
     ROOT, TEST_BROKER, startCli, killAll, waitFor, transferCode, exited,
     sleep, makeDir, makeRandom, sha256, stageJournal, journalCovered,
@@ -22,17 +23,20 @@ import {
 const TMP = makeDir(join(ROOT, "test", ".tmp", "browser"));
 const DL = makeDir(join(TMP, "dl"));
 
-// ---- static server; FREEDROP_TEST_BROKER rewrites the broker list the
-// page ships with, so a hermetic run stays hermetic in the browser too
+// ---- the site as freedrop.dev serves it, built fresh; FREEDROP_TEST_BROKER
+// rewrites the broker list the page ships with, so a hermetic run stays
+// hermetic in the browser too
+const SITE = join(TMP, "site");
+build(SITE);
 const MIME = {
-    html: "text/html", js: "text/javascript", mjs: "text/javascript",
-    webmanifest: "application/manifest+json", png: "image/png",
+    html: "text/html", js: "text/javascript", mjs: "text/javascript", css: "text/css",
+    webmanifest: "application/manifest+json", png: "image/png", md: "text/markdown",
 };
 const server = createServer(async (req, res) => {
     const p = req.url.split(/[?#]/)[0];
-    const file = p === "/" ? "/index.html" : p;
+    const file = p.endsWith("/") ? `${p}index.html` : p;
     try {
-        let data = await readFile(ROOT + file);
+        let data = await readFile(SITE + file);
         if (file === "/signal.mjs" && TEST_BROKER) {
             data = data.toString().replace(
                 /export const DEFAULT_BROKERS = \[[^\]]*\]/,
@@ -170,7 +174,7 @@ test("CLI → browser: ICE before SDP survives a cold first visit", { timeout: 9
     t.after(() => page.context().close());
     await signalingRace(page, "early-ice");
     const got = collectDownloads(page);
-    await page.goto(`${BASE}/#${code}`);
+    await page.goto(`${BASE}/r/#${code}`);
     await page.getByRole("button", { name: /Save|保存/ }).click({ timeout: 15_000 });
     await pageDone(page);
     const race = await page.evaluate(() => window.signalRace);
@@ -192,7 +196,7 @@ test("CLI → browser: stalled first handshake retries without a page reload", {
     await signalingRace(page, "stall");
     await page.clock.install();
     const got = collectDownloads(page);
-    await page.goto(`${BASE}/#${code}`);
+    await page.goto(`${BASE}/r/#${code}`);
     // Let the delayed setRemoteDescription finish before advancing the
     // handshake watchdog. The first answer is deliberately discarded.
     await page.clock.resume();
@@ -212,7 +216,7 @@ test("browser: an absent sender stops retries after the connection window", { ti
     t.after(() => page.context().close());
     await signalingRace(page, "observe");
     await page.clock.install();
-    await page.goto(`${BASE}/#${randomBytes(32).toString("base64url")}`);
+    await page.goto(`${BASE}/r/#${randomBytes(32).toString("base64url")}`);
     await waitFor(() => page.evaluate(() => window.signalRace.hellos.length), 10_000, "first hello");
     await page.clock.fastForward(15_000);
     assert.match(await page.locator("#status.error").textContent(), /no sender found|找不到发送方/i);
@@ -260,7 +264,7 @@ test("CLI → browser: the screen stays on while receiving, and again after the 
     t.after(() => page.context().close());
     await fakeWakeLock(page);
     const got = collectDownloads(page);
-    await page.goto(`${BASE}/#${code}`);
+    await page.goto(`${BASE}/r/#${code}`);
     const save = page.getByRole("button", { name: /Save|保存/ });
     await save.waitFor({ timeout: 15_000 });
     assert.equal(await wakeHeld(page), 0, "deciding at the Save button needs no lock");
@@ -290,6 +294,8 @@ test("browser → CLI: the sender keeps the screen on from the link until done",
     await page.setInputFiles("#picker", [join(W, "aaa.bin")]);
     const code = await waitFor(() => page.locator("#link").textContent()
         .then((s) => s.match(/npx freedrop ([A-Za-z0-9_-]{40,48})/)?.[1]), 30_000, "browser code");
+    assert.ok((await page.locator("#link").textContent()).includes(`${BASE.replace(/^https?:\/\//, "")}/r/#${code}`),
+        "the link opens the receive page");
     assert.equal(await wakeHeld(page), 1, "waiting for the receiver needs the screen on");
     const recv = startCli(["-y", "-o", dst, code]);
     assert.equal(await exited(recv), 0, recv.out);
@@ -389,10 +395,10 @@ test("CLI → browser: scanning QR codes receives on this page, one transfer aft
         5_000, "not-a-freedrop-code hint");
     assert.ok(await page.locator("#viewfinder").isVisible(), "a foreign QR code keeps scanning");
     // what the CLI's terminal QR code holds: the link on freedrop.dev —
-    // it opens here, on the page that scanned it
-    await page.evaluate((c) => window.scan.codes.push(`https://freedrop.dev/#${c}`), codeA);
+    // it opens here, on this site's receive page
+    await page.evaluate((c) => window.scan.codes.push(`https://freedrop.dev/r/#${c}`), codeA);
     await page.getByRole("button", { name: /Save|保存/ }).click({ timeout: 15_000 });
-    assert.equal(page.url(), `${BASE}/#${codeA}`);
+    assert.equal(page.url(), `${BASE}/r/#${codeA}`);
     await pageDone(page);
     assert.equal((await saveDownloads(page, got, ["aaa.txt"]))["aaa.txt"], await sha256(join(W, "aaa.txt")));
     assert.equal(await exited(senderA), 0, senderA.out);
@@ -405,9 +411,10 @@ test("CLI → browser: scanning QR codes receives on this page, one transfer aft
     assert.ok(await page.locator("#files .file a", { hasText: "aaa.txt" }).isVisible());
     assert.match(await page.locator("#status").textContent(), /✓/);
     await scanButton(page).click();
+    // a link from an older CLI, from before the receive page moved
     await page.evaluate((c) => window.scan.codes.push(`https://freedrop.dev/#${c}`), codeB);
     await page.getByRole("button", { name: /Save|保存/ }).click({ timeout: 15_000 });
-    assert.equal(page.url(), `${BASE}/#${codeB}`);
+    assert.equal(page.url(), `${BASE}/r/#${codeB}`);
     await pageDone(page);
     assert.equal((await saveDownloads(page, got, ["bbb.txt"]))["bbb.txt"], await sha256(join(W, "bbb.txt")));
     assert.equal(await exited(senderB), 0, senderB.out);
@@ -461,6 +468,41 @@ test("browser: installable — manifest, icons, an offline start, and the instal
     assert.ok(await page.locator("#install").isHidden());
 });
 
+test("browser: links open the receive page, old ones included", { timeout: 20_000 }, async (t) => {
+    const page = await newPage("links");
+    t.after(() => page.context().close());
+    const code = randomBytes(32).toString("base64url");
+    // what links looked like before /r/, and the older #k= form
+    await page.goto(`${BASE}/#${code}`);
+    await page.waitForURL(`${BASE}/r/#${code}`, { timeout: 5_000 });
+    await page.goto(`${BASE}/zh/#k=${code}`);
+    await page.waitForURL(`${BASE}/r/#k=${code}`, { timeout: 5_000 });
+    // the receive page with nothing to receive sends you home
+    await page.goto(`${BASE}/r/`);
+    await page.waitForURL(`${BASE}/`, { timeout: 5_000 });
+});
+
+test("browser: the app speaks the page's language; the receive page, the browser's", { timeout: 20_000 }, async () => {
+    const zhBrowser = await browser.newContext({ locale: "zh-CN", serviceWorkers: "block" });
+    const enBrowser = await browser.newContext({ locale: "en-US", serviceWorkers: "block" });
+    const text = (page, sel) => waitFor(() => page.locator(sel).textContent(), 5_000, sel);
+    try {
+        const en = await zhBrowser.newPage();
+        await en.goto(`${BASE}/`);
+        assert.match(await text(en, "#drop-title"), /Drop files|Choose files/);
+        const zh = await enBrowser.newPage();
+        await zh.goto(`${BASE}/zh/`);
+        assert.match(await text(zh, "#drop-title"), /拖文件|选择要发送/);
+        const r = await zhBrowser.newPage();
+        await r.goto(`${BASE}/r/#${randomBytes(32).toString("base64url")}`);
+        assert.equal(await text(r, "#tagline"), "点对点传文件，不经过任何服务器");
+        assert.equal(await r.evaluate(() => document.documentElement.lang), "zh-Hans");
+    } finally {
+        await zhBrowser.close();
+        await enBrowser.close();
+    }
+});
+
 test("browser → CLI: files shared from another app go straight to sending", { timeout: 90_000 }, async (t) => {
     const W = makeDir(join(TMP, "share-target"));
     const dst = makeDir(join(W, "dst"));
@@ -498,7 +540,7 @@ test("CLI → browser: striped big + small + empty", { timeout: 300_000 }, async
     const code = await transferCode(sender);
     const page = await newPage("c2b");
     const got = collectDownloads(page);
-    await page.goto(`${BASE}/#${code}`);
+    await page.goto(`${BASE}/r/#${code}`);
     await page.getByRole("button", { name: /Save|保存/ }).click({ timeout: 30_000 });
     await pageDone(page);
     const hashes = await saveDownloads(page, got, ["big.bin", "small.bin", "empty.bin"]);
@@ -539,7 +581,7 @@ test("browser → browser: multi-file with ICE before offers and answers", { tim
     const recvPage = await newPage("b2b-recv");
     await signalingRace(recvPage, "early-ice");
     const got = collectDownloads(recvPage);
-    await recvPage.goto(`${BASE}/#${code}`);
+    await recvPage.goto(`${BASE}/r/#${code}`);
     await recvPage.getByRole("button", { name: /Save|保存/ }).click({ timeout: 30_000 });
     await pageDone(recvPage);
     const hashes = await saveDownloads(recvPage, got, ["small.bin", "empty.bin"]);
@@ -599,7 +641,7 @@ test("CLI → browser: waits for the previous page's OPFS handle to close", { ti
     const page = await owner.context().newPage();
     const got = collectDownloads(page);
     const ready = page.waitForEvent("worker");
-    await page.goto(`${BASE}/#${code}`);
+    await page.goto(`${BASE}/r/#${code}`);
     await ready;
     await sleep(250);
     await owner.evaluate(() => window.releaseStage());
@@ -619,7 +661,7 @@ test("CLI → browser: reload mid-transfer resumes; verified files come back fro
     const code = await transferCode(sender);
     const page = await newPage("reload");
     const got = collectDownloads(page);
-    await page.goto(`${BASE}/#${code}`);
+    await page.goto(`${BASE}/r/#${code}`);
     await page.getByRole("button", { name: /Save|保存/ }).click({ timeout: 30_000 });
     await waitFor(() => page.locator("#bar div").evaluate((el) => parseInt(el.style.width) >= 20),
         60_000, "partial progress");
@@ -656,7 +698,7 @@ test("CLI → browser: a finished link reopens as received; its stage is swept o
     const ctx = page.context();
     t.after(() => ctx.close());
     const first = collectDownloads(page);
-    await page.goto(`${BASE}/#${code}`);
+    await page.goto(`${BASE}/r/#${code}`);
     await page.getByRole("button", { name: /Save|保存/ }).click({ timeout: 30_000 });
     await pageDone(page);
     await saveDownloads(page, first, names);
@@ -682,7 +724,7 @@ test("CLI → browser: a finished link reopens as received; its stage is swept o
     const rid = stageRid(code);
     const otherCode = randomBytes(32).toString("base64url");
     const other = await ctx.newPage();
-    await other.goto(`${BASE}/#${otherCode}`);
+    await other.goto(`${BASE}/r/#${otherCode}`);
     await waitFor(async () => (await stages(other)).includes(stageRid(otherCode)), 10_000, "second stage");
     assert.ok((await stages(other)).includes(rid), "an open tab's received files must survive a sweep");
     await saveAgain();
@@ -702,7 +744,7 @@ test("CLI → browser: a finished link reopens as received; its stage is swept o
     }, [rid, stageRid(otherCode)]), 10_000, "closed tabs to release their stages");
     const thirdCode = randomBytes(32).toString("base64url");
     const third = await ctx.newPage();
-    await third.goto(`${BASE}/#${thirdCode}`);
+    await third.goto(`${BASE}/r/#${thirdCode}`);
     await waitFor(async () => (await stages(third)).includes(stageRid(thirdCode)), 10_000, "third stage");
     const left = await stages(third);
     assert.ok(!left.includes(rid), "a received link's stage must be swept once its tab is gone");
