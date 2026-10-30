@@ -44,6 +44,8 @@ site.
 | `FREEDROP_RTC=js` | force the werift (pure JS) engine instead of node-datachannel |
 | `FREEDROP_DEBUG` | `[dbg]` / `[rtc:…]` logging to stderr |
 | `FREEDROP_PAGE` | base URL of the links the CLI prints (default `https://freedrop.dev/`) |
+| `FREEDROP_STUN` | comma-separated `stun:` URLs replacing the CLI's list — tests point it at `startStun()` stand-ins that play a scripted NAT |
+| `FREEDROP_ICE_POLICY=relay` | relay-only ICE: set on both ends and without `--turn`, the peers meet but can't connect — the exit-4 path, on loopback |
 
 ## Invariants that break things quietly
 
@@ -58,6 +60,12 @@ site.
 - **Don't use node-datachannel's `setSctpSettings`.** Any buffer override
   tears down associations under full-rate load (see the note in
   `cli.mjs`); WAN throughput comes from striping over 4 connections.
+- **The CLI engines each use one STUN server per connection** —
+  libdatachannel picks one of the list at random, werift takes the first.
+  Hand them `stunServers` (what answered the startup probe), never the
+  raw `STUN` list: one server unreachable from the user's network then
+  silently costs a share of connections their public candidate.
+  Browsers ask every server, so the page passes the full list.
 - **npm ships only what `files` in `package.json` lists** (`cli.mjs`,
   `lock.mjs`, `signal.mjs`). A new module the CLI imports must be added
   there, or the published package breaks while every local test passes.

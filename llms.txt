@@ -47,7 +47,11 @@ until the transfer finishes.
 - `saved` (receive): `name`, `path`, `size`
 - `status`: `message` — human-readable, wording may change
 - `done`: `total`, `seconds` — then exit 0
-- `error`: `error`, `code` (= exit status), `message` — then exit
+- `error`: `error`, `code` (= exit status), `message` — then exit. A
+  `connect` error adds `nat` {`here`, `peer`}: each end's {`type`,
+  `ipv6`} or null, `type` one of `open`, `cone`, `symmetric`, `blocked`
+  (no STUN server answered), `unknown`. `symmetric` on both ends, or
+  `blocked` on either, means only a TURN relay will connect them
 
 ## Exit statuses
 

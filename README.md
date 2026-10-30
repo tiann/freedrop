@@ -77,6 +77,26 @@ freedrop --turn turn:turn.example.com:3478 --turn-auth user:pass big.iso
 There is deliberately no relay fallback: that is why freedrop has no
 traffic bill, and why nobody's server ever holds your data.
 
+When a connection fails, each end says why. At startup every end asks
+all the STUN servers from one socket: the same public port from each
+means a hole-punchable NAT, different ports a symmetric one. The ends
+swap verdicts over the room, so the error names the end that is behind
+symmetric NAT, or says that neither NAT is the problem (then it is
+usually a firewall dropping UDP). The same probe also keeps unreachable
+STUN servers out of the connection: the WebRTC engines each ask only one
+server per connection, so a server that never answers from your network
+(Google's, from mainland China) would otherwise cost it its public
+address. The verdicts are also in the `--json` error event (`nat`).
+
+IPv6 has no NAT, so two ends that both have it can usually connect
+directly even when both their IPv4 NATs are symmetric. The CLI
+advertises its IPv6 addresses as they are; a browser hides its own
+behind an mDNS name and shows a public one only through a STUN server
+it reaches over IPv6 (Cloudflare's and Google's answer on IPv6). A
+firewall that drops unsolicited inbound traffic can still block the
+path. `FREEDROP_DEBUG=1` prints the candidate pair each CLI connection
+settles on (`path: host [2408:…]:… → …`).
+
 ## Options
 
 | Flag | | |
@@ -124,7 +144,7 @@ With `--json`, stdout carries nothing but these events, one per line:
 | `saved` | receive | `name`, `path` (absolute), `size` — once per verified file |
 | `status` | both | `message` — human-readable, wording may change |
 | `done` | both | `total`, `seconds` — then exit 0 |
-| `error` | both | `error`, `code` (the exit status), `message` — then exit |
+| `error` | both | `error`, `code` (the exit status), `message` — then exit. A `connect` error adds `nat`: `{here, peer}`, each `{type, ipv6}` or `null` (`peer` is `null` when the other end never sent one), where `type` is `open`, `cone`, `symmetric`, `blocked` (no STUN server answered) or `unknown` |
 
 Exit statuses are stable in both modes:
 

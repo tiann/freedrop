@@ -24,17 +24,24 @@ import { open } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
 import { randomBytes, createHash } from "node:crypto";
 import { createInterface } from "node:readline";
+import { createSocket } from "node:dgram";
+import { lookup } from "node:dns/promises";
+import { networkInterfaces } from "node:os";
 import qrcode from "qrcode-terminal";
 import { SignalRoom, IceInbox, b64u, DEFAULT_BROKERS } from "./signal.mjs";
 import { acquireLeaseLock } from "./lock.mjs";
 
 const PAGE = process.env.FREEDROP_PAGE ?? "https://freedrop.dev/";
 
-const STUN = [
-    { urls: "stun:stun.cloudflare.com:3478" },
-    { urls: "stun:stun.l.google.com:19302" },
-    { urls: "stun:stun.miwifi.com:3478" }, // reachable from mainland China
-];
+// FREEDROP_STUN (comma-separated stun: URLs) replaces the list — the
+// tests point it at local stand-ins that play a scripted NAT
+const STUN = process.env.FREEDROP_STUN
+    ? process.env.FREEDROP_STUN.split(",").map((u) => ({ urls: u.trim() })).filter((s) => s.urls)
+    : [
+        { urls: "stun:stun.cloudflare.com:3478" },
+        { urls: "stun:stun.l.google.com:19302" },
+        { urls: "stun:stun.miwifi.com:3478" }, // reachable from mainland China
+    ];
 
 const HELP = `freedrop — send files directly, CLI or browser, no server in the path
 
@@ -95,8 +102,8 @@ const EXIT_NAME = Object.fromEntries(Object.entries(EXIT).map(([k, v]) => [v, k]
 const emit = JSON_OUT ? (ev) => process.stdout.write(`${JSON.stringify(ev)}\n`) : () => {};
 const say = JSON_OUT ? console.error : console.log;
 
-const die = (msg, code = EXIT.failed) => {
-    emit({ event: "error", error: EXIT_NAME[code], code, message: msg.trim() });
+const die = (msg, code = EXIT.failed, fields = {}) => {
+    emit({ event: "error", error: EXIT_NAME[code], code, message: msg.trim(), ...fields });
     console.error(msg);
     process.exit(code);
 };
@@ -312,6 +319,164 @@ async function turnServers() {
     die(`--turn: expected "cloudflare" or a turn:/turns: URL, got "${t}"`, EXIT.usage);
 }
 
+// test hook: FREEDROP_ICE_POLICY=relay advertises relay candidates only.
+// On both ends and without --turn, the peers meet but can never connect
+// (one end alone isn't enough: it still answers the other's checks).
+const rtcConfig = (iceServers) =>
+    process.env.FREEDROP_ICE_POLICY === "relay" ? { iceServers, iceTransportPolicy: "relay" } : { iceServers };
+
+// ---- STUN probe -------------------------------------------------------------
+// Both engines ask ONE STUN server per connection — libdatachannel picks
+// one of the list at random, werift always takes the first — so a server
+// this network can't reach (Google's, from mainland China) silently costs
+// a connection its public candidate, and two port-restricted NATs then
+// never meet. So every server gets asked once at startup, all from one
+// socket: the answers say which servers to hand the engine, and how this
+// NAT maps — one public port whatever the destination (hole-punchable),
+// or a new one per destination (symmetric). Each end tells the other its
+// verdict over the room, so a failed connection can say which end it was.
+
+const PROBE_MS = 1500; // answer window, from the first request out
+const PROBE_CAP = 3000; // slow DNS included
+const NAT_TYPES = ["open", "cone", "symmetric", "blocked", "unknown"];
+// a peer's verdict comes off the wire — keep only what we understand
+const natOf = (n) => (NAT_TYPES.includes(n?.type) ? { type: n.type, ipv6: n.ipv6 === true } : null);
+
+let stunServers = STUN; // narrowed to the servers that answered
+let natHere = null; // { type, ipv6 }
+
+// "stun:host:port", "stun:[v6]:port" → { host, port }
+const stunTarget = (url) => {
+    const m = /^stuns?:(\[[^\]]+\]|[^:]+)(?::(\d+))?$/i.exec(url);
+    return m && { host: m[1].replace(/^\[|\]$/g, ""), port: Number(m[2] ?? 3478) };
+};
+// one spelling per IPv6 address, so answers compare with interface addresses
+const ipKey = (ip) => (ip.includes(":") ? new URL(`http://[${ip}]`).hostname.slice(1, -1) : ip);
+
+// XOR-MAPPED-ADDRESS from a Binding success response (or MAPPED-ADDRESS,
+// from servers that predate RFC 5389)
+function mappedAddress(buf) {
+    let found = null;
+    const end = Math.min(buf.length, 20 + buf.readUInt16BE(2));
+    for (let at = 20; at + 4 <= end;) {
+        const type = buf.readUInt16BE(at);
+        const v = buf.subarray(at + 4, at + 4 + buf.readUInt16BE(at + 2));
+        at += 4 + Math.ceil(v.length / 4) * 4;
+        const xor = type === 0x0020;
+        if ((!xor && type !== 0x0001) || v.length < 8) continue;
+        // the X- form is masked with the magic cookie + transaction id
+        const raw = Buffer.alloc(v.length - 4);
+        for (let i = 0; i < raw.length; i++) raw[i] = v[4 + i] ^ (xor ? buf[4 + i] : 0);
+        const port = v.readUInt16BE(2) ^ (xor ? 0x2112 : 0);
+        if (v[1] === 1) found = { ip: [...raw.subarray(0, 4)].join("."), port };
+        else if (v[1] === 2 && raw.length >= 16) {
+            const groups = [];
+            for (let i = 0; i < 16; i += 2) groups.push(raw.readUInt16BE(i).toString(16));
+            found = { ip: ipKey(groups.join(":")), port };
+        }
+        if (found && xor) break;
+    }
+    return found;
+}
+
+// a Binding Request to every server, per address family, from one socket
+// per family; retried until the deadline. Resolves with what came back,
+// and which families a request went out for at all.
+function stunAsk() {
+    const MAGIC = 0x2112a442;
+    return new Promise((resolve) => {
+        const pending = new Map(); // transaction id → { url, family, ip, port, req }
+        const got = [];
+        const asked = new Set();
+        const socks = {};
+        let lookups = STUN.length;
+        let over = false;
+        let grace = null;
+        const end = () => {
+            if (over) return;
+            over = true;
+            clearTimeout(cap);
+            clearTimeout(grace);
+            clearInterval(resend);
+            for (const s of Object.values(socks)) { try { s.close(); } catch {} }
+            resolve({ got, asked });
+        };
+        const settle = () => { if (!lookups && !pending.size) end(); };
+        const cap = setTimeout(end, PROBE_CAP);
+        const send = (id, p) => socks[p.family].send(p.req, p.port, p.ip, (e) => {
+            if (e && pending.delete(id)) settle(); // no route for this family
+        });
+        const resend = setInterval(() => { for (const [id, p] of pending) send(id, p); }, 300);
+        const onAnswer = (buf) => {
+            if (buf.length < 20 || buf.readUInt16BE(0) !== 0x0101 || buf.readUInt32BE(4) !== MAGIC) return;
+            const id = buf.toString("hex", 8, 20);
+            const p = pending.get(id);
+            const mapped = p && mappedAddress(buf);
+            if (!mapped) return;
+            pending.delete(id);
+            got.push({ url: p.url, family: p.family, ...mapped });
+            settle();
+        };
+        for (const family of [4, 6]) {
+            const s = createSocket(`udp${family}`);
+            s.on("message", onAnswer);
+            s.on("error", () => {}); // e.g. no IPv6 at all: that family just never answers
+            socks[family] = s;
+        }
+        for (const { urls } of STUN) {
+            const t = stunTarget(urls);
+            (t ? lookup(t.host, { all: true }) : Promise.resolve([])).then((addrs) => {
+                for (const family of [4, 6]) {
+                    const a = addrs.find((x) => x.family === family);
+                    if (over || !a) continue;
+                    const id = randomBytes(12);
+                    const req = Buffer.alloc(20); // Binding Request, no attributes
+                    req.writeUInt16BE(0x0001, 0);
+                    req.writeUInt32BE(MAGIC, 4);
+                    id.copy(req, 8);
+                    const p = { url: urls, family, ip: a.address, port: t.port, req };
+                    pending.set(id.toString("hex"), p);
+                    asked.add(family);
+                    grace ??= setTimeout(end, PROBE_MS);
+                    send(id.toString("hex"), p);
+                }
+            }, () => {}).finally(() => { lookups--; settle(); });
+        }
+    });
+}
+
+async function probeNat() {
+    const { got, asked } = await stunAsk();
+    const answered = new Set(got.map((g) => g.url));
+    if (answered.size) stunServers = STUN.filter(({ urls }) => answered.has(urls));
+    const local = new Set(Object.values(networkInterfaces()).flat().map((i) => ipKey(i.address)));
+    const v4 = got.filter((g) => g.family === 4);
+    natHere = {
+        // no answer to a request that went out: UDP blocked. No request
+        // at all (DNS down) proves nothing.
+        type: !v4.length ? (asked.has(4) ? "blocked" : "unknown")
+            : v4.some((g) => local.has(g.ip)) ? "open"
+            : v4.length < 2 ? "unknown"
+            : new Set(v4.map((g) => `${g.ip}:${g.port}`)).size > 1 ? "symmetric" : "cone",
+        ipv6: got.some((g) => g.family === 6),
+    };
+    dbg?.(`stun: ${got.map((g) => `${g.url} → ${g.ip}:${g.port}`).join(", ") || "no answer"}` +
+        ` — nat ${natHere.type}${natHere.ipv6 ? ", IPv6" : ""}`);
+}
+
+// the candidate pair a connection settled on, for FREEDROP_DEBUG: shows
+// whether a transfer went over IPv6, a LAN, or a relay
+function pathOf(pc) {
+    try {
+        const p = native ? pc.selectedCandidatePair() : pc.iceTransports[0].connection.nominated;
+        const ends = native ? [p.local, p.remote] : [p.localCandidate, p.remoteCandidate];
+        return ends.map((c) => {
+            const ip = c.address ?? c.host;
+            return `${c.type} ${ip.includes(":") ? `[${ip}]` : ip}:${c.port}`;
+        }).join(" → ");
+    } catch { return "unknown"; }
+}
+
 // ---- wire framing -----------------------------------------------------------
 // Every DataChannel message is binary. Tag 1 = UTF-8 JSON control message;
 // tag 0 = file bytes, followed by an 8-byte offset into the transfer's
@@ -476,11 +641,37 @@ function progressLine(verb, done, total, t0, skipped = 0) {
     draw(`${verb}${pct}  ${fmtSize(done)} / ${fmtSize(total)}${rate}`);
 }
 
-// P2P failure before any data is the one error fresh users hit — explain it
-const NAT_HINT =
-    "\nWebRTC could not connect (symmetric NAT or CGNAT on both ends?).\n" +
-    "Retry with a TURN relay on the SENDING side: --turn cloudflare\n" +
-    "(free 1 TB/month — see the README)";
+// P2P failure before any data is the one error fresh users hit — explain
+// it, from both ends' probe verdicts when the peer sent one
+const NAT_SAYS = {
+    open: "public IP, no NAT",
+    cone: "NAT keeps one public port per socket — hole-punchable",
+    symmetric: "symmetric NAT — a new public port for every destination",
+    blocked: "no STUN server answered — UDP blocked?",
+    unknown: "NAT type unknown — only one STUN server answered",
+};
+function natHint(peer) {
+    const here = natHere;
+    const says = (n) => (n ? NAT_SAYS[n.type] + (n.ipv6 ? "; has IPv6" : "") : "unknown");
+    const sym = (n) => n?.type === "symmetric";
+    const easy = (n) => n?.type === "open" || n?.type === "cone";
+    const why =
+        here?.type === "blocked" ? "No STUN server answered from this network, so it likely blocks UDP; a TURN relay over TLS (turns:, port 443) can still get out."
+        : peer?.type === "blocked" ? "No STUN server answered from the other end's network, so it likely blocks UDP."
+        : sym(here) && sym(peer) ? "Both ends are behind symmetric NAT: there is no hole to punch."
+        : sym(here) ? "This end is behind symmetric NAT, and the other end's NAT is too strict to meet it."
+        : sym(peer) ? "The other end is behind symmetric NAT, and this end's NAT is too strict to meet it."
+        : easy(here) && easy(peer) ? "Neither NAT should stop P2P, so a firewall is probably dropping UDP."
+        : "Symmetric NAT or CGNAT on both ends?";
+    const v6 = here?.ipv6 && peer?.ipv6 ? " Both ends have IPv6, and that path failed too." : "";
+    return "\nWebRTC could not connect.\n" +
+        `  this end:  ${says(here)}\n` +
+        `  other end: ${says(peer)}\n` +
+        `${why}${v6}\n` +
+        "Retry with a TURN relay on the SENDING side: --turn cloudflare\n" +
+        "(free 1 TB/month — see the README)";
+}
+const dieNat = (peer) => die(natHint(peer), EXIT.connect, { nat: { here: natHere, peer: peer ?? null } });
 
 const dbg = process.env.FREEDROP_DEBUG ? (...a) => console.error("\n[dbg]", ...a) : null;
 
@@ -521,10 +712,12 @@ async function send(paths) {
         key = Buffer.from(b64u.decode(fixed));
     } else key = randomBytes(32);
     const code = b64u.encode(new Uint8Array(key));
+    const probing = probeNat(); // in parallel with the broker connection
     const turn = await turnServers().catch((e) => die(`--turn: ${e.message}`));
 
     const room = await SignalRoom.create({ key, role: "host", brokers: BROKERS })
         .catch((e) => die(`cannot reach any rendezvous broker: ${e.message}`, EXIT.broker));
+    await probing;
 
     say(`freedrop: ${files.length} file(s), ${fmtSize(total)}`);
     for (const f of files) say(`  ${f.name}  (${fmtSize(f.size)})`);
@@ -563,7 +756,7 @@ async function send(paths) {
                 idleSince = Date.now();
             } else if (Date.now() - idleSince >= TIMEOUT_MS) {
                 status("");
-                if (natFailed && !acceptedEver) die(NAT_HINT, EXIT.connect);
+                if (natFailed && !acceptedEver) dieNat(at?.peerNat);
                 die(acceptedEver
                     ? `\nthe receiver did not come back in time — it keeps its partial data.\nresume with:\n  ${resumeCmd}`
                     : "\nno receiver in time", EXIT.timeout);
@@ -726,7 +919,7 @@ async function send(paths) {
     };
 
     const addStripe = (a, k) => {
-        const pc = new RTCPeerConnection({ iceServers: [...STUN, ...turn] });
+        const pc = new RTCPeerConnection(rtcConfig([...stunServers, ...turn]));
         const c = { pc, dc: null, used: false };
         a.conns[k] = c;
         pc.onconnectionstatechange = () => {
@@ -752,20 +945,22 @@ async function send(paths) {
         })().catch(() => {}); // a stripe that never opens is not fatal
     };
 
-    const beginAttempt = (sid, connsWanted) => {
+    const beginAttempt = (sid, connsWanted, peerNat) => {
         // stripes need native engines on both ends; werift ends say 1
         const maxConns = native ? Math.min(connsWanted ?? 1, STRIPE_CONNS) : 1;
         const a = {
             sid, conns: [], ice: new IceInbox(), dead: false, streaming: false,
-            drainResolve: null, chunkSize: 16 * 1024 - 9,
+            drainResolve: null, chunkSize: 16 * 1024 - 9, peerNat,
         };
         at = a;
         status("receiver found, connecting…");
-        const pc = new RTCPeerConnection({ iceServers: [...STUN, ...turn] });
+        dbg?.(`receiver nat: ${JSON.stringify(peerNat)}`);
+        const pc = new RTCPeerConnection(rtcConfig([...stunServers, ...turn]));
         const c0 = { pc, dc: null, used: true };
         a.conns[0] = c0;
         pc.onconnectionstatechange = () => {
             dbg?.(`send conn 0 pc: ${pc.connectionState}`);
+            if (pc.connectionState === "connected") dbg?.(`send conn 0 path: ${pathOf(pc)}`);
             if (pc.connectionState === "failed" && !a.dead) {
                 teardown(a);
                 if (at === a && acceptedEver) {
@@ -773,8 +968,9 @@ async function send(paths) {
                 } else if (at === a) {
                     natFailed = true;
                     status("");
-                    console.error(`${NAT_HINT}\nstill waiting — a receiver retry may get through…`);
-                    emit({ event: "status", message: NAT_HINT.trim() });
+                    const hint = natHint(a.peerNat);
+                    console.error(`${hint}\nstill waiting — a receiver retry may get through…`);
+                    emit({ event: "status", message: hint.trim() });
                 }
             }
         };
@@ -834,7 +1030,7 @@ async function send(paths) {
             const offer = await pc.createOffer();
             await pc.setLocalDescription(offer);
             // TURN rides along so the receiving side gets a relay path too
-            room.send({ sid: a.sid, t: "offer", sdp: pc.localDescription.sdp, ice: turn });
+            room.send({ sid: a.sid, t: "offer", sdp: pc.localDescription.sdp, ice: turn, nat: natHere });
         })().catch((e) => { if (at === a && !a.dead) die(`webrtc: ${e.message}`); });
         if (total >= STRIPE_MIN) {
             for (let k = 1; k < maxConns; k++) addStripe(a, k);
@@ -849,16 +1045,23 @@ async function send(paths) {
             // receiver arrives with a fresh sid.
             if (at && !at.dead && msg.sid === at.sid) return;
             teardown(at);
-            beginAttempt(msg.sid, msg.conns);
+            beginAttempt(msg.sid, msg.conns, natOf(msg.nat));
         } else if (!at || msg.sid !== at.sid) {
             // stale attempt traffic
         } else if (msg.t === "answer") {
             const k = msg.conn ?? 0;
-            if (k === 0) at.chunkSize = chunkFor(msg.sdp);
+            if (k === 0) {
+                at.chunkSize = chunkFor(msg.sdp);
+                at.peerNat = natOf(msg.nat) ?? at.peerNat;
+            }
             const pc = at.conns[k]?.pc;
             if (pc) at.ice.setRemoteDescription(k, pc, { type: "answer", sdp: msg.sdp }).catch(() => {});
         } else if (msg.t === "ice") {
             at.ice.add(msg.conn ?? 0, msg.candidate);
+        } else if (msg.t === "nat") {
+            // a page's probe can finish after its hello and answer went out
+            at.peerNat = natOf(msg.nat) ?? at.peerNat;
+            dbg?.(`receiver nat: ${JSON.stringify(at.peerNat)}`);
         }
     };
 }
@@ -894,6 +1097,7 @@ async function receive(code) {
     const rid = createHash("sha256").update(`freedrop-stage:${code}`).digest("hex").slice(0, 20);
     const stageRoot = join(outDir, ".freedrop-stage");
     const stageDir = join(stageRoot, rid);
+    const probing = probeNat(); // in parallel with the broker connection
     const turnExtra = await turnServers().catch((e) => die(`--turn: ${e.message}`));
     const waitMs = Math.min(10_000, Math.max(1, CONNECT_WINDOW - (Date.now() - startedAt)));
     const room = await SignalRoom.create({ key, role: "viewer", brokers: BROKERS, waitMs })
@@ -917,6 +1121,7 @@ async function receive(code) {
     // ---- attempt state ----
     let at = null; // { sid, pcs: [{ pc, ch, rx, last }], dc, gotOffer }
     let senderFound = false;
+    let peerNat = null; // the sender's probe verdict, from its offer
     let disconnectedAt = 0;
     let lastData = Date.now();
 
@@ -1340,7 +1545,7 @@ async function receive(code) {
             sid: randomBytes(8).toString("hex"),
             pcs: [], ice: new IceInbox(), dc: null, gotOffer: false, gotManifest: false, lastSignalAt: Date.now(),
         };
-        room.send({ sid: at.sid, t: "hello", conns: native ? STRIPE_CONNS : 1 });
+        room.send({ sid: at.sid, t: "hello", conns: native ? STRIPE_CONNS : 1, nat: natHere });
     };
 
     const retry = (why) => {
@@ -1349,7 +1554,7 @@ async function receive(code) {
         const now = Date.now();
         if (!manifest) {
             if (now - startedAt >= CONNECT_WINDOW) {
-                if (senderFound) die(NAT_HINT, EXIT.connect);
+                if (senderFound) dieNat(peerNat);
                 die("no sender found — is `freedrop <files>` still running on the other side?", EXIT.timeout);
             }
             status("connection lost — reconnecting…");
@@ -1374,13 +1579,16 @@ async function receive(code) {
             a.gotOffer = true;
             if (k === 0) {
                 senderFound = true;
+                peerNat = natOf(msg.nat) ?? peerNat;
+                dbg?.(`sender nat: ${JSON.stringify(peerNat)}`);
                 status(manifest ? "reconnected…" : "sender found, connecting…");
             }
-            const pc = new RTCPeerConnection({ iceServers: [...STUN, ...(msg.ice ?? []), ...turnExtra] });
+            const pc = new RTCPeerConnection(rtcConfig([...stunServers, ...(msg.ice ?? []), ...turnExtra]));
             const c = { pc, ch: null, rx: false, last: -1 };
             a.pcs[k] = c;
             pc.onconnectionstatechange = () => {
                 dbg?.(`recv conn ${k} pc: ${pc.connectionState}`);
+                if (pc.connectionState === "connected") dbg?.(`recv conn ${k} path: ${pathOf(pc)}`);
                 if (at !== a || pc.connectionState !== "failed") return;
                 if (k === 0 || c.rx) retry(`conn ${k} failed`);
             };
@@ -1410,10 +1618,14 @@ async function receive(code) {
                 if (at !== a) return;
                 const answer = await pc.createAnswer();
                 await pc.setLocalDescription(answer);
-                if (at === a) room.send({ sid: a.sid, t: "answer", conn: k, sdp: pc.localDescription.sdp });
+                if (at === a) room.send({ sid: a.sid, t: "answer", conn: k, sdp: pc.localDescription.sdp, nat: natHere });
             })().catch((e) => { if (at === a) retry(`webrtc: ${e.message}`); });
         } else if (msg.t === "ice") {
             at.ice.add(msg.conn ?? 0, msg.candidate);
+        } else if (msg.t === "nat") {
+            // a page's probe can finish after its offer went out
+            peerNat = natOf(msg.nat) ?? peerNat;
+            dbg?.(`sender nat: ${JSON.stringify(peerNat)}`);
         }
     };
 
@@ -1425,7 +1637,7 @@ async function receive(code) {
     // restarts) after us, and a first hello lost in broker weather
     const helloTimer = setInterval(() => {
         if (at && !at.gotOffer && !finished) {
-            room.send({ sid: at.sid, t: "hello", conns: native ? STRIPE_CONNS : 1 });
+            room.send({ sid: at.sid, t: "hello", conns: native ? STRIPE_CONNS : 1, nat: natHere });
         }
     }, 5000);
     helloTimer.unref?.();
@@ -1449,6 +1661,7 @@ async function receive(code) {
     }, 1000);
     healthTimer.unref?.();
 
+    await probing;
     startAttempt();
 }
 

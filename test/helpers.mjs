@@ -3,6 +3,7 @@
 // the public brokers by default; set FREEDROP_TEST_BROKER to a local
 // ws:// MQTT broker for a hermetic run (CI does — see the workflow).
 import { spawn } from "node:child_process";
+import { createSocket } from "node:dgram";
 import { createHash, randomBytes } from "node:crypto";
 import { createReadStream, createWriteStream, readFileSync, mkdirSync, rmSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -55,6 +56,34 @@ export const exited = (proc, ms = 180_000) =>
     waitFor(() => proc.exitCode !== null, ms, "process exit").then(() => proc.exitCode);
 
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// A STUN server on loopback that plays a NAT: it answers every Binding
+// Request with 203.0.113.7 and the asker's port plus `shift` — two
+// servers with different shifts make a symmetric NAT, equal shifts a
+// cone. `silent` never answers. `ports` collects every asking port.
+export function startStun({ shift = 0, silent = false } = {}) {
+    const s = createSocket("udp4");
+    const ports = new Set();
+    s.on("message", (m, r) => {
+        if (m.length < 20 || m.readUInt16BE(0) !== 0x0001) return;
+        ports.add(r.port);
+        if (silent) return;
+        const res = Buffer.alloc(32);
+        res.writeUInt16BE(0x0101, 0); // Binding success
+        res.writeUInt16BE(12, 2);
+        m.copy(res, 4, 4, 20); // magic cookie + transaction id
+        res.writeUInt16BE(0x0020, 20); // XOR-MAPPED-ADDRESS, IPv4
+        res.writeUInt16BE(8, 22);
+        res[25] = 1;
+        res.writeUInt16BE(((r.port + shift) & 0xffff) ^ 0x2112, 26);
+        [203, 0, 113, 7].forEach((b, i) => { res[28 + i] = b ^ res[4 + i]; });
+        s.send(res, r.port, r.address);
+    });
+    s.unref();
+    return new Promise((resolve) => {
+        s.bind(0, "127.0.0.1", () => resolve({ url: `stun:127.0.0.1:${s.address().port}`, ports }));
+    });
+}
 
 // a --json process's stdout: every line must be one JSON event
 export const events = (proc) => proc.stdoutText.split("\n").filter(Boolean).map((l) => JSON.parse(l));

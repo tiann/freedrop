@@ -13,7 +13,7 @@ import { dirname, join } from "node:path";
 import { randomBytes } from "node:crypto";
 import {
     ROOT, startCli, killAll, waitFor, transferCode, exited, sleep, events,
-    makeDir, makeRandom, sha256, stageJournal, journalCovered, journalDone,
+    makeDir, makeRandom, sha256, stageJournal, journalCovered, journalDone, startStun,
 } from "./helpers.mjs";
 
 const TMP = makeDir(join(ROOT, "test", ".tmp", "cli"));
@@ -461,6 +461,48 @@ test("exit codes: bad arguments exit 2, a sender's --timeout exits 7", { timeout
     const sender = startCli(["--json", "--timeout", "2", join(W, "f.bin")]);
     assert.equal(await exited(sender, 40_000), 7, sender.out);
     assert.deepEqual(events(sender).map((e) => e.event), ["ready", "error"]);
+});
+
+// relay-only ICE without a TURN server: the peers meet over the room but
+// have no candidate to connect with — what a pair of unpunchable NATs
+// looks like from inside
+test("a failed connection exits 4 and says which end is behind symmetric NAT", { timeout: 60_000 }, async () => {
+    const W = makeDir(join(TMP, "nat"));
+    await makeRandom(join(W, "f.bin"), 1000);
+    const cone = [await startStun(), await startStun()].map((s) => s.url).join(",");
+    const symmetric = [await startStun(), await startStun({ shift: 7 })].map((s) => s.url).join(",");
+    const sender = startCli(["--json", join(W, "f.bin")], { FREEDROP_STUN: cone, FREEDROP_ICE_POLICY: "relay" });
+    const code = await transferCode(sender);
+    const recv = startCli(["--json", "-y", "-o", makeDir(join(W, "dst")), code],
+        { FREEDROP_STUN: symmetric, FREEDROP_ICE_POLICY: "relay" });
+    assert.equal(await exited(recv, 45_000), 4, recv.out);
+    const err = events(recv).at(-1);
+    assert.equal(err.error, "connect");
+    assert.deepEqual(err.nat, { here: { type: "symmetric", ipv6: false }, peer: { type: "cone", ipv6: false } });
+    assert.match(recv.out, /this end: +symmetric NAT/);
+    assert.match(recv.out, /other end: +NAT keeps one public port/);
+    assert.match(recv.out, /--turn/);
+});
+
+// both engines ask a single STUN server per connection (werift: always
+// the first), so one that never answers must not reach the engine at all
+test("a STUN server that never answers is left out of the engine's list", { timeout: 120_000 }, async () => {
+    const W = makeDir(join(TMP, "stun-dead"));
+    const dst = makeDir(join(W, "dst"));
+    await makeRandom(join(W, "f.bin"), 1e6);
+    const dead = await startStun({ silent: true });
+    const live = await startStun();
+    const sender = startCli([join(W, "f.bin")], { FREEDROP_STUN: live.url });
+    const code = await transferCode(sender);
+    const recv = startCli(["-y", "-o", dst, code], { FREEDROP_RTC: "js", FREEDROP_STUN: `${dead.url},${live.url}` });
+    assert.equal(await exited(recv), 0, recv.out);
+    assert.equal(await exited(sender), 0, sender.out);
+    assert.equal(await sha256(join(dst, "f.bin")), await sha256(join(W, "f.bin")));
+    // the receiver's probe asks both from one socket; only the live one
+    // also hears from werift's own socket
+    assert.equal(dead.ports.size, 1, "only the probe asked the dead server");
+    assert.ok(live.ports.has([...dead.ports][0]), "the probe asked both");
+    assert.ok([...live.ports].some((p) => !dead.ports.has(p)), "the engine asked the live one");
 });
 
 test("twin files (same name/size/mtime, different bytes) resume-pair by manifest slot", { timeout: 300_000 }, async () => {

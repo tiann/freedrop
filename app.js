@@ -29,6 +29,61 @@ const HANDSHAKE_TIMEOUT = 5000;
 const CONNECT_WINDOW = 15_000;
 const RETRY_WINDOW = 90_000;
 
+// ---- NAT probe ---------------------------------------------------------------
+// One throwaway connection asks every STUN server from the same socket,
+// and the browser drops answers it already has: more than one public
+// port behind one public address is a symmetric NAT (a new mapping per
+// destination). The verdict rides along in hello, offer and answer, so
+// whichever end fails can say which end it was — the CLI probes the same
+// way. A page never sees its own host address (mDNS hides it), so "open"
+// can't come up here, and a lone answering server reads as a cone.
+// Gathering can outlast the first hello or answer: whatever attempt is
+// current when the probe ends also gets the verdict as a "nat" message.
+const NAT_TYPES = ["open", "cone", "symmetric", "blocked", "unknown"];
+const natOf = (n) => (NAT_TYPES.includes(n?.type) ? { type: n.type, ipv6: n.ipv6 === true } : null);
+let natHere = null;
+const probeNat = () => new Promise((resolve) => {
+    let pc;
+    try { pc = new RTCPeerConnection({ iceServers: STUN }); } catch { return resolve(); }
+    const seen = [];
+    const finish = () => {
+        if (!pc) return;
+        pc.close();
+        pc = null;
+        const ports = new Map(); // public IPv4 → the ports it came back with
+        for (const [ip, port] of seen) {
+            if (!ip.includes(":")) ports.set(ip, (ports.get(ip) ?? new Set()).add(port));
+        }
+        natHere = {
+            type: !ports.size ? "blocked" : [...ports.values()].some((p) => p.size > 1) ? "symmetric" : "cone",
+            ipv6: seen.some(([ip]) => ip.includes(":")),
+        };
+        resolve();
+    };
+    pc.onicecandidate = (e) => {
+        const m = / (\S+) (\d+) typ srflx/.exec(e.candidate?.candidate ?? "");
+        if (m) seen.push([m[1], m[2]]);
+        if (!e.candidate) finish();
+    };
+    pc.createDataChannel("probe");
+    pc.createOffer().then((o) => pc?.setLocalDescription(o)).catch(finish);
+    setTimeout(finish, 3000);
+});
+
+// a failed connection, explained from both ends' verdicts when known
+const p2pWhy = (peer) => {
+    const sym = (n) => n?.type === "symmetric";
+    const easy = (n) => n?.type === "open" || n?.type === "cone";
+    const why = natHere?.type === "blocked" ? T.nat.blockedHere
+        : peer?.type === "blocked" ? T.nat.blockedPeer
+        : sym(natHere) && sym(peer) ? T.nat.both
+        : sym(natHere) ? T.nat.here
+        : sym(peer) ? T.nat.peer
+        : easy(natHere) && easy(peer) ? T.nat.neither
+        : null;
+    return why ? T.p2pWhy(why) : T.p2pFail;
+};
+
 const zh = (navigator.language || "").toLowerCase().startsWith("zh");
 const touch = matchMedia("(pointer: coarse)").matches;
 const T = zh ? {
@@ -68,6 +123,15 @@ const T = zh ? {
     retry: "重试",
     noSender: "找不到发送方 — 确认对方的 freedrop 还开着",
     p2pFail: "P2P 连接失败 — 检查网络；若双方都在对称 NAT/CGNAT 后，可在发送方加 --turn",
+    p2pWhy: (why) => `P2P 连接失败 — ${why}；可在发送方加 --turn`,
+    nat: {
+        both: "双方都在对称 NAT 后，没有可打的洞",
+        here: "本机在对称 NAT 后，对方的 NAT 又太严，打不通",
+        peer: "对方在对称 NAT 后，本机的 NAT 又太严，打不通",
+        blockedHere: "本机网络收不到任何 STUN 服务器的回应，可能屏蔽了 UDP",
+        blockedPeer: "对方网络收不到任何 STUN 服务器的回应，可能屏蔽了 UDP",
+        neither: "两端的 NAT 都不该挡住 P2P，多半是防火墙丢了 UDP",
+    },
     savedReload: "连接中断 — 进度已保存，重新打开此链接可续传",
     declined: "对方拒绝了",
     busyTab: "这个链接正在另一个标签页接收 — 关掉那边或用那边",
@@ -120,6 +184,15 @@ const T = zh ? {
     retry: "Try again",
     noSender: "No sender found — is their freedrop still running?",
     p2pFail: "P2P failed — check the network; for symmetric NAT/CGNAT on both ends, try --turn on the sender",
+    p2pWhy: (why) => `P2P failed — ${why}; try --turn on the sender`,
+    nat: {
+        both: "both ends are behind symmetric NAT, so there is no hole to punch",
+        here: "this device is behind symmetric NAT, and the other end's NAT is too strict to meet it",
+        peer: "the other end is behind symmetric NAT, and this network's NAT is too strict to meet it",
+        blockedHere: "no STUN server answered this network, so it likely blocks UDP",
+        blockedPeer: "no STUN server answered the other end's network, so it likely blocks UDP",
+        neither: "neither NAT should stop P2P, so a firewall is probably dropping UDP",
+    },
     savedReload: "Connection lost — progress is saved; reopen this link to resume",
     declined: "The other side declined",
     busyTab: "This link is already being received in another tab — use that one",
@@ -801,6 +874,7 @@ function sendMode() {
 
         const key = crypto.getRandomValues(new Uint8Array(32));
         const codeStr = b64u.encode(key);
+        const probing = probeNat();
         const room = await SignalRoom.create({ key, role: "host" })
             .catch(() => { throw new Error(T.brokerFail); });
 
@@ -1072,9 +1146,9 @@ function sendMode() {
             })().catch(() => {}); // a stripe that never opens is not fatal
         };
 
-        const beginAttempt = (sid, connsWanted) => {
+        const beginAttempt = (sid, connsWanted, peerNat) => {
             const maxConns = Math.min(connsWanted ?? 1, STRIPE_CONNS);
-            const a = { sid, conns: [], ice: new IceInbox(), dead: false, streaming: false, drainResolve: null };
+            const a = { sid, conns: [], ice: new IceInbox(), dead: false, streaming: false, drainResolve: null, peerNat };
             at = a;
             status(T.connecting, "busy");
             const pc = new RTCPeerConnection({ iceServers: STUN });
@@ -1084,7 +1158,7 @@ function sendMode() {
                 if (pc.connectionState === "failed" && !a.dead) {
                     if (!acceptedEver && at === a) {
                         teardown(a);
-                        fatal(T.p2pFail); // keep the TURN hint visible — lost() would overwrite it
+                        fatal(p2pWhy(a.peerNat)); // keep the TURN hint visible — lost() would overwrite it
                     } else lost(a);
                 }
             };
@@ -1139,7 +1213,7 @@ function sendMode() {
             (async () => {
                 const offer = await pc.createOffer();
                 await pc.setLocalDescription(offer);
-                room.send({ sid: a.sid, t: "offer", sdp: pc.localDescription.sdp, ice: [] });
+                room.send({ sid: a.sid, t: "offer", sdp: pc.localDescription.sdp, ice: [], nat: natHere });
             })().catch((e) => { if (at === a && !a.dead) fatal(String(e.message ?? e)); });
             if (total >= STRIPE_MIN) {
                 for (let k = 1; k < maxConns; k++) addStripe(a, k);
@@ -1152,17 +1226,21 @@ function sendMode() {
                 // (re)connecting receiver and supersedes the old attempt
                 if (at && !at.dead && msg.sid === at.sid) return;
                 teardown(at);
-                beginAttempt(msg.sid, msg.conns);
+                beginAttempt(msg.sid, msg.conns, natOf(msg.nat));
             } else if (!at || msg.sid !== at.sid) {
                 // stale attempt traffic
             } else if (msg.t === "answer") {
                 const k = msg.conn ?? 0;
+                if (k === 0) at.peerNat = natOf(msg.nat) ?? at.peerNat;
                 const pc = at.conns[k]?.pc;
                 if (pc) at.ice.setRemoteDescription(k, pc, { type: "answer", sdp: msg.sdp }).catch(() => {});
             } else if (msg.t === "ice") {
                 at.ice.add(msg.conn ?? 0, msg.candidate);
+            } else if (msg.t === "nat") {
+                at.peerNat = natOf(msg.nat) ?? at.peerNat;
             }
         };
+        probing.then(() => { if (at && !at.dead) room.send({ sid: at.sid, t: "nat", nat: natHere }); });
     }
 }
 
@@ -1302,6 +1380,7 @@ async function receive(codeStr) {
     const saved = state.entries;
 
     const key = b64u.decode(codeStr);
+    const probing = probeNat();
     const waitMs = Math.min(10_000, Math.max(1, CONNECT_WINDOW - (Date.now() - startedAt)));
     const room = await SignalRoom.create({ key, role: "viewer", waitMs })
         .catch(() => { throw new Error(T.brokerFail); });
@@ -1323,6 +1402,7 @@ async function receive(codeStr) {
     // ---- attempt state ----
     let at = null; // { sid, pcs: [{ pc, ch, rx, last }], dc, gotOffer }
     let senderFound = false;
+    let peerNat = null; // the sender's probe verdict, from its offer
     let disconnectedAt = 0;
     let lastData = Date.now();
     const timers = [];
@@ -1547,14 +1627,14 @@ async function receive(codeStr) {
             sid: hex(crypto.getRandomValues(new Uint8Array(8))),
             pcs: [], ice: new IceInbox(), dc: null, gotOffer: false, gotManifest: false, lastSignalAt: Date.now(),
         };
-        room.send({ sid: at.sid, t: "hello", conns: STRIPE_CONNS });
+        room.send({ sid: at.sid, t: "hello", conns: STRIPE_CONNS, nat: natHere });
     };
 
     const retry = () => {
         if (finished || failed) return;
         const now = Date.now();
         if (!manifest) {
-            if (now - startedAt >= CONNECT_WINDOW) return fail(senderFound ? T.p2pFail : T.noSender);
+            if (now - startedAt >= CONNECT_WINDOW) return fail(senderFound ? p2pWhy(peerNat) : T.noSender);
             status(T.connecting, "busy"); // never connected, so nothing was lost
             startAttempt();
             return;
@@ -1579,6 +1659,7 @@ async function receive(codeStr) {
             a.gotOffer = true;
             if (k === 0) {
                 senderFound = true;
+                peerNat = natOf(msg.nat) ?? peerNat;
                 if (!manifest) status(T.connecting, "busy");
             }
             const pc = new RTCPeerConnection({ iceServers: [...STUN, ...(msg.ice ?? [])] });
@@ -1612,12 +1693,14 @@ async function receive(codeStr) {
                 if (at !== a) return;
                 const answer = await pc.createAnswer();
                 await pc.setLocalDescription(answer);
-                if (at === a) room.send({ sid: a.sid, t: "answer", conn: k, sdp: pc.localDescription.sdp });
+                if (at === a) room.send({ sid: a.sid, t: "answer", conn: k, sdp: pc.localDescription.sdp, nat: natHere });
             } catch {
                 if (at === a) retry();
             }
         } else if (msg.t === "ice") {
             at.ice.add(msg.conn ?? 0, msg.candidate);
+        } else if (msg.t === "nat") {
+            peerNat = natOf(msg.nat) ?? peerNat;
         }
     };
 
@@ -1625,7 +1708,7 @@ async function receive(codeStr) {
     // restarts) after us, and a first hello lost in broker weather
     timers.push(setInterval(() => {
         if (at && !at.gotOffer && !finished) {
-            room.send({ sid: at.sid, t: "hello", conns: STRIPE_CONNS });
+            room.send({ sid: at.sid, t: "hello", conns: STRIPE_CONNS, nat: natHere });
         }
     }, 5000));
 
@@ -1653,4 +1736,5 @@ async function receive(codeStr) {
     }, 1000));
 
     startAttempt();
+    probing.then(() => { if (at) room.send({ sid: at.sid, t: "nat", nat: natHere }); });
 }
