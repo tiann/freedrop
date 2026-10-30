@@ -503,6 +503,26 @@ test("browser: the app speaks the page's language; the receive page, the browser
     }
 });
 
+test("browser: on a phone the app card is on the first screen", { timeout: 30_000 }, async () => {
+    // the tightest common case: an iPhone SE's Safari, bars and all, with
+    // the scan button Android's Chrome adds
+    for (const path of ["/", "/zh/"]) {
+        const ctx = await browser.newContext({
+            viewport: { width: 375, height: 548 }, isMobile: true, hasTouch: true, serviceWorkers: "block",
+        });
+        try {
+            const page = await ctx.newPage();
+            await fakeScanner(page);
+            await page.goto(`${BASE}${path}`);
+            await page.locator("#scan").waitFor({ timeout: 5_000 });
+            const bottom = await page.locator("#card").evaluate((c) => c.getBoundingClientRect().bottom);
+            assert.ok(bottom <= 548, `${path}: the card ends at ${bottom}px, below the first screen`);
+        } finally {
+            await ctx.close();
+        }
+    }
+});
+
 test("browser → CLI: files shared from another app go straight to sending", { timeout: 90_000 }, async (t) => {
     const W = makeDir(join(TMP, "share-target"));
     const dst = makeDir(join(W, "dst"));

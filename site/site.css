@@ -225,13 +225,15 @@ body {
 
 /* ---- the home page's first screen: the pitch beside the app ---- */
 .site > section.hero { padding-top: 2.5rem; }
+/* on a phone the card comes right after the headline, the rest below it:
+   it must be on the first screen (a browser test holds it to that) */
 .hero-grid {
     display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 28rem);
-    grid-template-areas: "copy app" "more app"; gap: 1.5rem 4.5rem; align-items: start;
+    grid-template-areas: "copy app" "lead app" "more app"; gap: 1.25rem 4.5rem; align-items: start;
 }
-.hero-copy { grid-area: copy; align-self: end; }
-.hero-copy h1 { margin-top: .6rem; font-size: clamp(2.2rem, 1.3rem + 3.2vw, 3.5rem); }
-.hero-copy .lead { margin: 0; }
+.hero-copy { grid-area: copy; }
+.site .hero-copy h1 { margin: .6rem 0 0; font-size: clamp(2.2rem, 1.3rem + 3.2vw, 3.5rem); }
+.site .hero-lead { grid-area: lead; margin: 0; }
 .hero-app { grid-area: app; align-self: center; display: flex; justify-content: center; }
 .hero-more { grid-area: more; }
 .site .hero-more .small { margin: 0 0 .5rem; }
@@ -273,8 +275,7 @@ body {
     .toc { display: none; }
 }
 @media (max-width: 860px) {
-    .hero-grid { grid-template-columns: minmax(0, 1fr); grid-template-areas: "copy" "app" "more"; gap: 1.5rem; }
-    .hero-copy { align-self: auto; }
+    .hero-grid { grid-template-columns: minmax(0, 1fr); grid-template-areas: "copy" "app" "lead" "more"; }
     .site-foot .in { grid-template-columns: 1fr 1fr; }
     .foot-about { grid-column: 1 / -1; }
     .split, .qa { grid-template-columns: 1fr; gap: 2rem; }
@@ -285,6 +286,9 @@ body {
 }
 @media (max-width: 600px) {
     .site > section { padding-top: 4rem; }
+    .site > section.hero { padding-top: .5rem; }
+    .site .hero-copy h1 { font-size: clamp(1.85rem, 1.2rem + 3vw, 2.4rem); line-height: 1.1; }
+    .topbar { padding-block: .75rem; }
     .site > section.band { margin-top: 4rem; padding-block: 4rem; }
     .diagram { padding: 1.25rem 1rem; }
     .diagram .wide { display: none; }
@@ -306,7 +310,7 @@ body {
 }
 /* the installed app is just the app */
 @media (display-mode: standalone) {
-    .topbar, .hero-copy, .hero-more, .hero .stats, .site > section:not(.hero), .site-foot { display: none; }
+    .topbar, .hero-copy, .hero-lead, .hero-more, .hero .stats, .site > section:not(.hero), .site-foot { display: none; }
     .site > section.hero { min-height: 100vh; min-height: 100dvh; display: grid; place-items: center; padding: 2rem 1rem; }
     .hero-grid { display: block; }
 }
