@@ -116,6 +116,8 @@ Web page — `test/browser.test.mjs` reads state from the DOM:
   `BarcodeDetector` and the camera (headless Linux Chromium has neither)
 - a sending page sets `onbeforeunload`, so a test that reloads or
   navigates away from it gets blocked
+- reopening a finished link shows `✓` at once, with its files as
+  `.file a` links and `#hint` matching `/can't be received again|不能再接收/`
 - the installed app's ways in: a multipart POST of `files` to
   `./?share-target` starts sending them, `./?scan` opens the scanner;
   both leave the URL at `./`. `#install` shows on `beforeinstallprompt`

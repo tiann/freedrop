@@ -61,6 +61,8 @@ const T = zh ? {
     doneSend: (s, t) => `已发送 ${s}，用时 ${t} · 对方已校验`,
     doneRecv: (s, t) => `已接收 ${s}，用时 ${t} · 已校验`,
     savedHint: "已存到下载目录，点文件名可再次保存",
+    landed: (s) => `此链接已接收过 ${s} · 已校验`,
+    landedHint: "发送方已结束，这个链接不能再接收；点文件名可再次保存",
     sendMore: "继续发送",
     startOver: "重新开始",
     retry: "重试",
@@ -111,6 +113,8 @@ const T = zh ? {
     doneSend: (s, t) => `Sent ${s} in ${t} — verified by the receiver`,
     doneRecv: (s, t) => `Received ${s} in ${t} — verified`,
     savedHint: "Saved to your downloads — click a file to save it again.",
+    landed: (s) => `Already received ${s} — verified`,
+    landedHint: "The sender has finished, so this link can't be received again — click a file to save it again.",
     sendMore: "Send more files",
     startOver: "Start over",
     retry: "Try again",
@@ -247,6 +251,22 @@ const listFiles = (files) => {
 const markDone = (row) => {
     row.classList.add("done");
     row.querySelector(".tile").innerHTML = ICON.check;
+};
+// a received file's row becomes a link to it, for when the browser blocks
+// the automatic save (multi-file transfers, mobile quirks) or to save it
+// again; returns the URL
+const linkFile = (i, path, file) => {
+    const url = URL.createObjectURL(file);
+    const row = $("files").children[i];
+    if (row) {
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = path.split("/").pop();
+        a.textContent = path;
+        row.querySelector(".name").replaceChildren(a);
+        markDone(row);
+    }
+    return url;
 };
 
 // a phone that turns its screen off suspends the tab, and a suspended tab
@@ -424,14 +444,22 @@ const writeJournal = (f, obj) => { // throws: callers decide what a failure mean
 // ones leave empty journals).
 let metaAccess = null;
 let metaDone = false;
+let metaFiles = 0; // done only: how many files landed, so a revisit can list them
 const writeMeta = () => {
     if (!metaAccess) return;
     try {
-        const buf = enc.encode(JSON.stringify({ v: 1, done: metaDone, t: Date.now() }));
+        const buf = enc.encode(JSON.stringify({ v: 1, done: metaDone, n: metaFiles || undefined, t: Date.now() }));
         metaAccess.write(buf, { at: 0 });
         metaAccess.truncate(buf.length);
         metaAccess.flush();
     } catch {}
+};
+const readMeta = () => {
+    try {
+        const buf = new Uint8Array(metaAccess.getSize());
+        metaAccess.read(buf, { at: 0 });
+        return JSON.parse(new TextDecoder().decode(buf));
+    } catch { return null; }
 };
 setInterval(() => { if (!metaDone) writeMeta(); }, 15_000);
 
@@ -476,7 +504,11 @@ async function init(rid) {
     dir = await top.getDirectoryHandle(rid, { create: true });
     // claim this stage: the open meta handle doubles as a liveness lock
     metaAccess = await openAccess(await dir.getFileHandle("meta", { create: true }));
-    writeMeta();
+    // a landed link stays landed: rewriting its marker as not-done would
+    // keep the whole copy out of the sweep for another KEEP_MS
+    const prior = readMeta();
+    metaDone = !!(prior && prior.done);
+    if (!metaDone) writeMeta();
     // journals from an interrupted visit of this same link
     const entries = [];
     const ids = new Set();
@@ -502,7 +534,32 @@ async function init(rid) {
         savedSeq.set(i, j.seq);
         entries.push({ i, name: j.name, size: j.size, mtime: j.mtime, ranges: j.ranges, done: !!j.done });
     }
+    if (metaDone) {
+        // its sender closed the room when it landed — hand back the staged
+        // files instead. The meta handle stays open, so no other tab's
+        // sweep pulls them out from under this page.
+        const landed = await landedFiles(entries, prior.n);
+        if (landed) return postMessage({ op: "landed", files: landed });
+        metaDone = false; // a marker is missing: receive it again
+        writeMeta();
+    }
     postMessage({ op: "state", entries });
+}
+
+// a landed transfer's files in manifest order, or null when they can't
+// all be accounted for (a failed done-marker write, a pre-n meta)
+async function landedFiles(entries, n) {
+    if (!Number.isInteger(n) || n < 1) return null;
+    const out = [];
+    for (let i = 0; i < n; i++) {
+        const e = entries.find((x) => x.i === i);
+        if (!e || !e.done) return null;
+        let file;
+        try { file = await (await dir.getFileHandle("f" + i)).getFile(); } catch { return null; }
+        if (file.size !== e.size) return null;
+        out.push({ name: e.name, size: e.size, file });
+    }
+    return out;
 }
 
 function flushJournals() {
@@ -621,6 +678,7 @@ onmessage = async (e) => {
             }
         } else if (m.op === "complete") { // whole transfer landed
             metaDone = true;
+            metaFiles = m.n;
             writeMeta();
             try { metaAccess.close(); } catch {}
         }
@@ -1200,8 +1258,8 @@ async function scan() {
 // that works on mobile), each verified file then becomes a normal
 // browser download backed by the staged bytes on disk, so nothing is
 // ever held in memory. The stage and its journal survive the tab: the
-// same link resumes where it stopped, and a lost connection re-hellos
-// into the same transfer.
+// same link resumes where it stopped, a lost connection re-hellos into
+// the same transfer, and a finished link reopens with its files.
 
 async function receive(codeStr) {
     const startedAt = Date.now();
@@ -1222,14 +1280,26 @@ async function receive(codeStr) {
         if (!granted) throw new Error(T.busyTab);
     }
     const worker = new Worker(URL.createObjectURL(new Blob([WORKER_SRC], { type: "text/javascript" })));
-    const saved = await new Promise((resolve, reject) => {
+    const state = await new Promise((resolve, reject) => {
         worker.onmessage = ({ data }) => {
-            if (data.op === "state") resolve(data.entries);
+            if (data.op === "state" || data.op === "landed") resolve(data);
             else reject(new Error(data.name === "NoModificationAllowedError" ? T.busyTab : data.message || T.tooOld));
         };
         worker.onerror = (e) => reject(new Error(e.message || T.tooOld));
         worker.postMessage({ op: "init", rid });
     });
+    if (state.op === "landed") {
+        // received on an earlier visit, and the sender left once it was
+        // done — there is nobody to connect to; offer the files again
+        $("trust").hidden = true;
+        listFiles(state.files);
+        state.files.forEach((f, i) => linkFile(i, f.name, f.file));
+        showDone(T.landed(fmtSize(state.files.reduce((n, f) => n + f.size, 0))));
+        hint(T.landedHint);
+        canScan().then((ok) => ok && action(T.scanMore, scan));
+        return;
+    }
+    const saved = state.entries;
 
     const key = b64u.decode(codeStr);
     const waitMs = Math.min(10_000, Math.max(1, CONNECT_WINDOW - (Date.now() - startedAt)));
@@ -1296,7 +1366,7 @@ async function receive(codeStr) {
     const finish = () => {
         if (finished || failed) return;
         finished = true;
-        worker.postMessage({ op: "complete" }); // mark the stage sweepable
+        worker.postMessage({ op: "complete", n: vfiles.length }); // mark the stage sweepable
         sendCtl({ t: "done" });
         showDone(T.doneRecv(fmtSize(total), fmtElapsed(Date.now() - t0)));
         hint(T.savedHint);
@@ -1306,27 +1376,15 @@ async function receive(codeStr) {
     };
 
     // a verified file becomes a download (disk-backed — no memory copy)
-    // and its list row becomes a link, for when the browser blocks the
-    // automatic click (multi-file transfers, mobile quirks)
+    // and its list row becomes a link
     const onFileReady = (i, file) => {
         if (failed) return;
         const f = vfiles[i];
         if (f.done) return;
         f.done = true;
-        const name = f.name.split("/").pop();
-        const url = URL.createObjectURL(file);
-        const row = $("files").children[i];
-        if (row) {
-            const a = document.createElement("a");
-            a.href = url;
-            a.download = name;
-            a.textContent = f.name;
-            row.querySelector(".name").replaceChildren(a);
-            markDone(row);
-        }
         const a = document.createElement("a");
-        a.href = url;
-        a.download = name;
+        a.href = linkFile(i, f.name, file);
+        a.download = f.name.split("/").pop();
         a.click();
         if (++completed === vfiles.length) finish();
     };
@@ -1497,7 +1555,7 @@ async function receive(codeStr) {
         const now = Date.now();
         if (!manifest) {
             if (now - startedAt >= CONNECT_WINDOW) return fail(senderFound ? T.p2pFail : T.noSender);
-            status(T.reconnecting, "busy");
+            status(T.connecting, "busy"); // never connected, so nothing was lost
             startAttempt();
             return;
         }

@@ -11,7 +11,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { chromium } from "playwright";
 import { createServer } from "node:http";
-import { randomBytes } from "node:crypto";
+import { randomBytes, createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
@@ -633,6 +633,80 @@ test("CLI → browser: reload mid-transfer resumes; verified files come back fro
     assert.match(sender.out, /resuming/, "the sender must see a resume, not a restart");
     assert.equal(await exited(sender), 0, sender.out);
     await page.context().close();
+});
+
+// a context's OPFS stages, named by rid (derived from the code)
+const stageRid = (code) => createHash("sha256").update(`freedrop-stage:${code}`).digest("hex").slice(0, 20);
+const stages = (page) => page.evaluate(async () => {
+    const top = await (await navigator.storage.getDirectory()).getDirectoryHandle("freedrop", { create: true });
+    const names = [];
+    for await (const n of top.keys()) names.push(n);
+    return names;
+});
+
+test("CLI → browser: a finished link reopens as received; its stage is swept once the tab is gone", { timeout: 120_000 }, async (t) => {
+    const W = makeDir(join(TMP, "landed"));
+    await makeRandom(join(W, "aaa.txt"), 200_000);
+    await makeRandom(join(W, "empty.bin"), 0);
+    const names = ["aaa.txt", "empty.bin"];
+    const sender = startCli(["--no-qr", ...names.map((n) => join(W, n))]);
+    t.after(() => sender.kill("SIGKILL"));
+    const code = await transferCode(sender);
+    const page = await newPage("landed");
+    const ctx = page.context();
+    t.after(() => ctx.close());
+    const first = collectDownloads(page);
+    await page.goto(`${BASE}/#${code}`);
+    await page.getByRole("button", { name: /Save|保存/ }).click({ timeout: 30_000 });
+    await pageDone(page);
+    await saveDownloads(page, first, names);
+    assert.equal(await exited(sender), 0, sender.out);
+
+    // the sender left when it was done: a reopen must not wait the
+    // connection window for it and then call it missing
+    const got = collectDownloads(page);
+    await page.reload();
+    await pageDone(page, 5000);
+    assert.match(await page.locator("#hint").textContent(), /can't be received again|不能再接收/);
+    await sleep(500);
+    assert.equal(got.size, 0, "a reopen must not save every file again unasked");
+    const saveAgain = async () => {
+        got.clear();
+        const hashes = await saveDownloads(page, got, names);
+        for (const n of names) assert.equal(hashes[n], await sha256(join(W, n)), n);
+    };
+    await saveAgain();
+
+    // another link's page sweeps finished stages — not this one while its
+    // tab still offers the files
+    const rid = stageRid(code);
+    const otherCode = randomBytes(32).toString("base64url");
+    const other = await ctx.newPage();
+    await other.goto(`${BASE}/#${otherCode}`);
+    await waitFor(async () => (await stages(other)).includes(stageRid(otherCode)), 10_000, "second stage");
+    assert.ok((await stages(other)).includes(rid), "an open tab's received files must survive a sweep");
+    await saveAgain();
+
+    // once the tab is gone the next visit reclaims the space; the other
+    // link's unfinished stage stays for a resume
+    await page.close();
+    await other.close();
+    const probe = await ctx.newPage();
+    await probe.goto(`${BASE}/`);
+    await waitFor(() => probe.evaluate(async (rids) => {
+        const top = await (await navigator.storage.getDirectory()).getDirectoryHandle("freedrop");
+        for (const r of rids) {
+            try { await (await (await top.getDirectoryHandle(r)).getFileHandle("meta")).getFile(); } catch { return false; }
+        }
+        return true;
+    }, [rid, stageRid(otherCode)]), 10_000, "closed tabs to release their stages");
+    const thirdCode = randomBytes(32).toString("base64url");
+    const third = await ctx.newPage();
+    await third.goto(`${BASE}/#${thirdCode}`);
+    await waitFor(async () => (await stages(third)).includes(stageRid(thirdCode)), 10_000, "third stage");
+    const left = await stages(third);
+    assert.ok(!left.includes(rid), "a received link's stage must be swept once its tab is gone");
+    assert.ok(left.includes(stageRid(otherCode)), "an unfinished stage must be kept for a resume");
 });
 
 test("browser sender resumes a SIGKILLed-and-re-run CLI receiver", { timeout: 300_000 }, async () => {

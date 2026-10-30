@@ -28,7 +28,9 @@ locally. Where the browser can read QR codes itself (Chrome on Android,
 macOS and ChromeOS), the page has a **Scan to receive** button: point it at
 the sender's QR code and the transfer opens right there, no camera-app
 detour. A finished transfer offers the same button, so a phone can take one
-transfer after another without going back to the start page.
+transfer after another without going back to the start page. A link
+carries one transfer: the sender leaves once it is done, and reopening
+the link shows the received files again, ready to save.
 
 The page is also an installable app (a PWA): **Install app** at the bottom
 of the page, or the browser's own menu. Installed on Android, freedrop
