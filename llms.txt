@@ -1,0 +1,77 @@
+# freedrop
+
+> Direct, end-to-end encrypted file transfer between any two of: a CLI
+> (`npx freedrop`) and a browser (https://freedrop.dev/). Peers meet
+> through encrypted messages on public MQTT brokers; the bytes flow over
+> WebRTC, never through a server. Both ends must be online at the same
+> time. Interrupted transfers resume; every file is verified (SHA-256)
+> before it appears.
+
+Node 22+. Always run it as `npx -y freedrop …` (`-y` skips npm's
+install prompt). Pass `--json` to get one JSON event per line on stdout;
+human text then goes to stderr.
+
+## Send a file to a person
+
+```bash
+npx -y freedrop --json --timeout 10m report.pdf data.csv
+```
+
+Run it in the background. The first stdout line is the `ready` event:
+give the person its `link` (they open it in any browser, on any device —
+no install) or, if they have a terminal, `npx freedrop <code>`. The
+process exits 0 once the receiver has verified every byte. Without
+`--timeout` the sender waits for a receiver indefinitely; `--timeout`
+counts only time with no transfer under way. Arguments must be regular
+files — `tar` a directory first.
+
+## Receive a file from a person
+
+Ask them to open https://freedrop.dev/, pick the files, and send you the
+link (or the `npx freedrop <code>` line) it shows. Then:
+
+```bash
+npx -y freedrop --json -y -o <dir> '<link or code>'
+```
+
+`-y` is required without a terminal (exit 2 otherwise). Each verified
+file produces a `saved` event with its absolute `path`; a name already
+taken in `<dir>` lands as `name(1).ext`. Keep the person's page open
+until the transfer finishes.
+
+## Events (`--json`)
+
+- `ready` (send): `code`, `link`, `files` [{name, size}], `total`
+- `incoming` (receive): `files`, `total`, `resumed` (bytes already on disk)
+- `progress`: `bytes`, `total` — at most every 10 s, and at 100 %
+- `saved` (receive): `name`, `path`, `size`
+- `status`: `message` — human-readable, wording may change
+- `done`: `total`, `seconds` — then exit 0
+- `error`: `error`, `code` (= exit status), `message` — then exit
+
+## Exit statuses
+
+- 0 done, every file verified
+- 1 `failed` — anything else; read the message
+- 2 `usage` — bad arguments, or a receiver without `-y` and no terminal
+- 3 `broker` — no rendezvous broker reachable (network, or `--broker`)
+- 4 `connect` — peers met but WebRTC could not connect: retry with
+  `--turn cloudflare` (needs CF_TURN_KEY_ID, CF_TURN_API_TOKEN) or
+  `--turn turn:host:3478 --turn-auth user:pass` on the sending side
+- 5 `verify` — a file failed verification or changed while sending; a
+  re-run transfers it fresh
+- 6 `declined` — the receiver said no
+- 7 `timeout` — `--timeout` passed, or a receiver found no sender (wrong
+  code, or the sender is gone)
+- 8 `lost` — connection lost mid-transfer; re-run the same command to
+  resume
+- 130 / 143 `interrupted` — SIGINT / SIGTERM; re-run to resume
+
+Interrupted and lost transfers print the exact command that resumes
+them: the receiver re-runs `freedrop -y -o <dir> <code>`, the sender
+`freedrop --code <code> <files>`.
+
+## Docs
+
+- [README](https://github.com/tiann/freedrop#readme): how it works, NAT and TURN, resume, options
+- [Source](https://github.com/tiann/freedrop)

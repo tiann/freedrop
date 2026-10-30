@@ -14,6 +14,7 @@ code won't tell you at a glance.
 | `lock.mjs` | directory lease lock guarding the CLI receiver's staging directory |
 | `qr.mjs` | dependency-free QR encoder for the page |
 | `test/` | `node --test` suites; `helpers.mjs` spawns real CLI processes |
+| `llms.txt` | usage guide for AI agents, served at freedrop.dev/llms.txt |
 
 `.github/workflows/pages.yml` publishes the **entire repository root** to
 freedrop.dev on every push to `main` — anything committed is public on the
@@ -78,7 +79,14 @@ CLI — tests merge stdout and stderr and match on text:
 - `resuming`, `reconnecting`, `no longer matches`
 - the receiver prints one `saved: <path>` line per file
 - without a terminal: no QR code, no `\r`/ANSI redraws, and a receiver
-  without `-y` exits 1 saying `pass -y`
+  without `-y` exits 2 saying `pass -y`
+
+`--json` events and exit statuses are public API for scripts and agents.
+They are documented in four places that must agree: `HELP` in `cli.mjs`,
+README → Scripts and agents, `llms.txt` (served at freedrop.dev/llms.txt),
+and the tests. Add fields freely; renaming or removing an event, a field,
+or an exit code breaks callers. Every `die()` should pass the `EXIT` code
+that tells a caller what to do next.
 
 Web page — `test/browser.test.mjs` reads state from the DOM:
 
