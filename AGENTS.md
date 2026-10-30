@@ -98,6 +98,11 @@ Web page — `test/browser.test.mjs` reads state from the DOM:
   are `.file a` containing the file name; progress is the single
   `#bar div`, with a percentage `style.width`; the sender's file input
   is `#picker`
+- the scan button (on the start page, and in `#actions` once a receive
+  is done) has an accessible name matching `/Scan|扫码/`; the camera
+  preview is `#viewfinder video`; a foreign QR code is reported in
+  `#hint`, a camera failure in `#hint.error`. The tests fake
+  `BarcodeDetector` and the camera (headless Linux Chromium has neither)
 - a sending page sets `onbeforeunload`, so a test that reloads or
   navigates away from it gets blocked
 

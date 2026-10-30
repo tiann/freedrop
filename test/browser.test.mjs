@@ -295,6 +295,113 @@ test("browser → CLI: the sender keeps the screen on from the link until done",
     assert.equal(await sha256(join(dst, "aaa.bin")), await sha256(join(W, "aaa.bin")));
 });
 
+// A stand-in camera and QR detector — headless Linux Chromium has no
+// BarcodeDetector at all. The camera is a canvas stream that counts its
+// stopped tracks; detect() reports the next string queued in
+// window.scan.codes, if any.
+const fakeScanner = (page, opts = {}) => page.addInitScript(({ formats = ["qr_code"], camera = true }) => {
+    window.scan = { codes: [], opened: 0, stopped: 0 };
+    window.BarcodeDetector = class {
+        static async getSupportedFormats() { return formats; }
+        async detect() {
+            const rawValue = window.scan.codes.shift();
+            return rawValue ? [{ rawValue, format: "qr_code" }] : [];
+        }
+    };
+    navigator.mediaDevices.getUserMedia = async () => {
+        if (!camera) throw new DOMException("Permission denied", "NotAllowedError");
+        const canvas = Object.assign(document.createElement("canvas"), { width: 64, height: 64 });
+        const g = canvas.getContext("2d");
+        setInterval(() => g.fillRect(0, 0, 64, 64), 100);
+        const stream = canvas.captureStream();
+        for (const track of stream.getTracks()) {
+            const stop = track.stop.bind(track);
+            track.stop = () => { window.scan.stopped++; stop(); };
+        }
+        window.scan.opened++;
+        return stream;
+    };
+}, opts);
+const scanButton = (page) => page.getByRole("button", { name: /Scan|扫码/ });
+
+test("browser: the scan button needs a QR detector; cancelling or a denied camera goes back", { timeout: 30_000 }, async (t) => {
+    const blind = await newPage("scan-blind");
+    t.after(() => blind.context().close());
+    await fakeScanner(blind, { formats: ["ean_13"] });
+    await blind.goto(`${BASE}/`);
+    await blind.locator("#drop").waitFor();
+    await blind.evaluate(() => new Promise((r) => setTimeout(r, 200)));
+    assert.ok(await scanButton(blind).isHidden(), "no qr_code format, no scan button");
+
+    const page = await newPage("scan-cancel");
+    t.after(() => page.context().close());
+    await fakeScanner(page);
+    await page.goto(`${BASE}/`);
+    await scanButton(page).click();
+    await waitFor(() => page.evaluate(() => !!document.querySelector("#viewfinder video").srcObject), 5_000, "camera preview");
+    assert.ok(await page.locator("#drop").isHidden());
+    await page.getByRole("button", { name: /Cancel|取消/ }).click();
+    assert.deepEqual(await page.evaluate(() => [window.scan.opened, window.scan.stopped]), [1, 1], "cancel stops the camera");
+    assert.ok(await page.locator("#viewfinder").isHidden());
+    assert.ok(await page.locator("#drop").isVisible());
+    assert.ok(await scanButton(page).isVisible());
+
+    const denied = await newPage("scan-denied");
+    t.after(() => denied.context().close());
+    await fakeScanner(denied, { camera: false });
+    await denied.goto(`${BASE}/`);
+    await scanButton(denied).click();
+    assert.match(await denied.locator("#hint.error").textContent(), /camera|相机/i);
+    assert.ok(await denied.locator("#viewfinder").isHidden());
+    await denied.getByRole("button", { name: /Cancel|取消/ }).click();
+    assert.ok(await scanButton(denied).isVisible(), "the button stays for another try");
+    assert.ok(await denied.locator("#hint").isHidden());
+});
+
+test("CLI → browser: scanning QR codes receives on this page, one transfer after another", { timeout: 120_000 }, async (t) => {
+    const W = makeDir(join(TMP, "scan"));
+    await makeRandom(join(W, "aaa.txt"), 1024);
+    await makeRandom(join(W, "bbb.txt"), 2048);
+    const senderA = startCli(["--no-qr", join(W, "aaa.txt")]);
+    const senderB = startCli(["--no-qr", join(W, "bbb.txt")]);
+    t.after(() => senderA.kill("SIGKILL"));
+    t.after(() => senderB.kill("SIGKILL"));
+    const [codeA, codeB] = await Promise.all([transferCode(senderA), transferCode(senderB)]);
+    const page = await newPage("scan");
+    t.after(() => page.context().close());
+    await fakeScanner(page);
+    const got = collectDownloads(page);
+    await page.goto(`${BASE}/`);
+    await scanButton(page).click();
+    await page.evaluate(() => window.scan.codes.push("https://example.com/"));
+    await waitFor(() => page.locator("#hint").textContent().then((s) => /isn't a freedrop|不是 freedrop/.test(s)),
+        5_000, "not-a-freedrop-code hint");
+    assert.ok(await page.locator("#viewfinder").isVisible(), "a foreign QR code keeps scanning");
+    // what the CLI's terminal QR code holds: the link on freedrop.dev —
+    // it opens here, on the page that scanned it
+    await page.evaluate((c) => window.scan.codes.push(`https://freedrop.dev/#${c}`), codeA);
+    await page.getByRole("button", { name: /Save|保存/ }).click({ timeout: 15_000 });
+    assert.equal(page.url(), `${BASE}/#${codeA}`);
+    await pageDone(page);
+    assert.equal((await saveDownloads(page, got, ["aaa.txt"]))["aaa.txt"], await sha256(join(W, "aaa.txt")));
+    assert.equal(await exited(senderA), 0, senderA.out);
+
+    // the finished page scans the next one; cancelling gives it back intact
+    await scanButton(page).click();
+    assert.ok(await page.locator("#viewfinder").isVisible());
+    assert.ok(await page.locator("#files").isHidden(), "the viewfinder covers the last transfer");
+    await page.getByRole("button", { name: /Cancel|取消/ }).click();
+    assert.ok(await page.locator("#files .file a", { hasText: "aaa.txt" }).isVisible());
+    assert.match(await page.locator("#status").textContent(), /✓/);
+    await scanButton(page).click();
+    await page.evaluate((c) => window.scan.codes.push(`https://freedrop.dev/#${c}`), codeB);
+    await page.getByRole("button", { name: /Save|保存/ }).click({ timeout: 15_000 });
+    assert.equal(page.url(), `${BASE}/#${codeB}`);
+    await pageDone(page);
+    assert.equal((await saveDownloads(page, got, ["bbb.txt"]))["bbb.txt"], await sha256(join(W, "bbb.txt")));
+    assert.equal(await exited(senderB), 0, senderB.out);
+});
+
 test("CLI → browser: striped big + small + empty", { timeout: 300_000 }, async () => {
     const W = makeDir(join(TMP, "c2b"));
     await makeRandom(join(W, "big.bin"), 100e6);

@@ -74,6 +74,12 @@ const T = zh ? {
     noSpace: (s) => `浏览器存储空间不足（需要 ${s}）`,
     noRtc: "此浏览器不支持 WebRTC",
     brokerFail: "连不上任何会合节点 — 检查网络",
+    scan: "扫码接收",
+    scanMore: "继续扫码接收",
+    aim: "对准发送方屏幕上的二维码",
+    notOurs: "这不是 freedrop 的二维码",
+    noCamera: "打不开相机 — 请允许此页面使用相机",
+    cancel: "取消",
 } : {
     tagline: "Peer-to-peer file transfer, no server in between",
     dropTitle: touch ? "Choose files to send" : "Drop files here",
@@ -117,6 +123,12 @@ const T = zh ? {
     noSpace: (s) => `Not enough browser storage (need ${s})`,
     noRtc: "This browser does not support WebRTC",
     brokerFail: "Cannot reach any rendezvous broker — check the network",
+    scan: "Scan to receive",
+    scanMore: "Scan to receive more",
+    aim: "Point the camera at the QR code on the sender's screen",
+    notOurs: "That QR code isn't a freedrop link",
+    noCamera: "Can't open the camera — allow this page to use it",
+    cancel: "Cancel",
 };
 
 const $ = (id) => document.getElementById(id);
@@ -625,10 +637,22 @@ $("trust-text").textContent = T.trust;
 addEventListener("dragover", (e) => e.preventDefault());
 addEventListener("drop", (e) => e.preventDefault());
 
-const code = decodeURIComponent(location.hash.slice(1).replace(/^k=/, ""));
+// the code in a link (`…/#<code>`, legacy `#k=<code>`, any host — every
+// copy of this page speaks the same protocol), in the CLI command, or bare
+const codeIn = (text) => {
+    const ok = (c) => (/^[A-Za-z0-9_-]{40,48}$/.test(c) ? c : null);
+    text = text.trim();
+    try {
+        const c = ok(decodeURIComponent(new URL(text).hash.slice(1).replace(/^k=/, "")));
+        if (c) return c;
+    } catch {}
+    return ok(text.replace(/^npx freedrop\s+/, ""));
+};
+
+const code = codeIn(location.href);
 if (typeof RTCPeerConnection === "undefined") {
     fatal(T.noRtc);
-} else if (/^[A-Za-z0-9_-]{40,48}$/.test(code)) {
+} else if (code) {
     receive(code).catch((e) => fatal(String(e.message ?? e)));
 } else {
     sendMode();
@@ -661,10 +685,14 @@ function sendMode() {
         if (!$("drop").hidden) go([...(e.dataTransfer?.files ?? [])]);
     };
     $("picker").onchange = () => go([...$("picker").files]);
+    $("scan-label").textContent = T.scan;
+    $("scan").onclick = scan;
+    canScan().then((ok) => { $("scan").hidden = !ok || $("drop").hidden; });
 
     async function start(files) {
         if (!files.length) return;
         $("drop").hidden = true;
+        $("scan").hidden = true;
         $("trust").hidden = true;
         listFiles(files);
         status(T.connecting, "busy");
@@ -1048,6 +1076,92 @@ function sendMode() {
     }
 }
 
+// ---- scan -------------------------------------------------------------------
+// Scanning with the camera app is a detour, and its link opens in
+// whatever browser it picks. Where the page has a QR detector of its own
+// (BarcodeDetector: Chromium on macOS, ChromeOS, and Android with Google
+// Play services) the landing page scans the sender's screen itself and
+// opens the code as if it were a link; elsewhere the button never shows.
+
+async function canScan() {
+    if (!navigator.mediaDevices?.getUserMedia || typeof BarcodeDetector === "undefined") return false;
+    const formats = await BarcodeDetector.getSupportedFormats().catch(() => []);
+    return formats.includes("qr_code");
+}
+
+async function scan() {
+    const video = $("viewfinder").firstElementChild;
+    const detector = new BarcodeDetector({ formats: ["qr_code"] });
+    // the viewfinder takes over the card — from the drop zone, or from a
+    // finished transfer's files — and cancelling puts back what it covered
+    const covered = [...$("card").children]
+        .filter((el) => !el.hidden && !["hint", "actions", "trust"].includes(el.id));
+    const hintWas = $("hint").textContent;
+    const actionsWas = [...$("actions").children];
+    let stream = null;
+    let live = true;
+    let unhint = 0;
+    const release = () => {
+        live = false;
+        clearTimeout(unhint);
+        for (const t of stream?.getTracks() ?? []) t.stop();
+        video.srcObject = null;
+    };
+    const cancel = () => {
+        if (!live) return;
+        release();
+        $("viewfinder").hidden = true;
+        for (const el of covered) el.hidden = false;
+        $("hint").classList.remove("error");
+        hint(hintWas);
+        $("actions").replaceChildren(...actionsWas);
+        $("actions").hidden = !actionsWas.length;
+    };
+    for (const el of covered) el.hidden = true;
+    $("viewfinder").hidden = false;
+    hint(T.aim);
+    clearActions();
+    action(T.cancel, cancel, "ghost");
+    try {
+        stream = await navigator.mediaDevices.getUserMedia({
+            video: { facingMode: "environment", width: { ideal: 1280 }, height: { ideal: 720 } },
+            audio: false,
+        });
+    } catch {
+        if (!live) return;
+        $("viewfinder").hidden = true;
+        hint(T.noCamera);
+        $("hint").classList.add("error");
+        return;
+    }
+    if (!live) return release(); // cancelled while the permission prompt was up
+    const [track] = stream.getVideoTracks();
+    track.onended = cancel; // taken by another app, or unplugged
+    // a webcam facing the user reads like a mirror; a rear camera doesn't
+    video.classList.toggle("mirror", track.getSettings().facingMode !== "environment");
+    video.srcObject = stream;
+    video.play().catch(() => {});
+    while (live) {
+        const found = await detector.detect(video).catch(() => []);
+        if (!live) return;
+        const hit = found.map((b) => codeIn(b.rawValue)).find(Boolean);
+        if (hit) {
+            release();
+            // a reload into the link's own URL: receiving runs exactly as
+            // it does from an opened link, and a retry reloads into it
+            location.hash = hit;
+            location.reload();
+            return;
+        }
+        if (found.length) {
+            hint(T.notOurs);
+            clearTimeout(unhint);
+            unhint = setTimeout(() => live && hint(T.aim), 2000);
+        }
+        await new Promise((r) => setTimeout(r, 150));
+    }
+}
+
 // ---- receive ----------------------------------------------------------------
 // MEGA-style client-side staging: chunks land positionally in OPFS
 // (origin-private, zero permission prompts — the only per-file write API
@@ -1154,6 +1268,8 @@ async function receive(codeStr) {
         sendCtl({ t: "done" });
         showDone(T.doneRecv(fmtSize(total), fmtElapsed(Date.now() - t0)));
         hint(T.savedHint);
+        // the next transfer is one scan away — no trip back to the start
+        canScan().then((ok) => ok && action(T.scanMore, scan));
         setTimeout(stop, 500);
     };
 

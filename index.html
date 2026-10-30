@@ -77,6 +77,15 @@
     #drop .glyph svg { width: 24px; height: 24px; }
     #drop strong { font-size: 1.05rem; font-weight: 600; }
     #drop-hint { color: var(--muted); font-size: .9rem; }
+    #scan { width: 100%; padding: .7rem 1rem; margin-top: -.25rem; }
+    #viewfinder { position: relative; overflow: hidden; aspect-ratio: 1; border-radius: 14px; background: #000; }
+    #viewfinder video { display: block; width: 100%; height: 100%; object-fit: cover; }
+    #viewfinder video.mirror { transform: scaleX(-1); }
+    #viewfinder::after {
+        content: ""; position: absolute; inset: 15%; border-radius: 16px;
+        border: 2px solid rgba(255, 255, 255, .9); box-shadow: 0 0 0 100vmax rgba(0, 0, 0, .35);
+    }
+    #viewfinder:not([hidden]) ~ #hint { text-align: center; }
 
     #summary { display: flex; justify-content: space-between; font-size: .8rem; color: var(--muted); margin-bottom: -.4rem; }
     #files { list-style: none; margin: 0; padding: 0; max-height: 15.5rem; overflow-y: auto; }
@@ -131,6 +140,7 @@
     #card.done #bar div { background: var(--ok); }
     #meta { font-size: .82rem; color: var(--muted); font-variant-numeric: tabular-nums; }
     #hint { margin: -.5rem 0 0; font-size: .82rem; color: var(--muted); }
+    #hint.error { margin-top: 0; text-align: center; color: var(--err); }
     #actions { display: flex; gap: .5rem; }
     #actions button { flex: 1; padding: .7rem 1rem; }
 
@@ -164,6 +174,11 @@
         <strong id="drop-title"></strong>
         <span id="drop-hint"></span>
     </button>
+    <button id="scan" class="ghost" type="button" hidden>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 8V6a2 2 0 0 1 2-2h2m8 0h2a2 2 0 0 1 2 2v2m0 8v2a2 2 0 0 1-2 2h-2m-8 0H6a2 2 0 0 1-2-2v-2M4 12h16"/></svg>
+        <span id="scan-label"></span>
+    </button>
+    <div id="viewfinder" hidden><video muted playsinline></video></div>
     <input id="picker" type="file" multiple hidden>
     <div id="summary" hidden><span id="count"></span></div>
     <ul id="files" hidden></ul>
