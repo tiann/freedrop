@@ -11,6 +11,7 @@ paying for your traffic.
 npx freedrop video.mp4
 
 # receive — the sender prints this command, a link, and a QR code
+# (the link works here too)
 npx freedrop uMDpiKrcHEIabTuxSCnCUOTdLoMs4DRLGP0lPmC8gVA
 ```
 
@@ -67,15 +68,36 @@ traffic bill, and why nobody's server ever holds your data.
 
 | Flag | | |
 |---|---|---|
-| `-y`, `--yes` | receive | skip the confirmation prompt |
+| `-y`, `--yes` | receive | skip the confirmation prompt (required without a terminal) |
 | `-o`, `--out <dir>` | receive | save files here (default: current dir) |
 | `--code <code>` | send | reuse a transfer code (resume an interrupted send) |
 | `--turn <target>` | both | `cloudflare` or a `turn:`/`turns:` URL |
 | `--turn-auth <u:p>` | both | credentials for a `--turn` URL |
 | `--broker <list>` | both | custom comma-separated `wss://` MQTT brokers |
-| `--no-qr` | send | don't print the QR code |
+| `--no-qr` | send | don't print the QR code (never printed without a terminal) |
 
 Node 22+ (uses the built-in WebSocket).
+
+## Scripts and agents
+
+Without a terminal — in a script, in CI, in an AI agent's shell — the CLI
+keeps its output to plain lines: no QR code, no in-place progress bar (a
+progress line every 10 s instead), and a receiver without `-y` exits at
+once instead of waiting on a prompt nobody can answer. A receiver takes
+the browser link as readily as the bare code (with or without
+`https://`), and finishes by printing one `saved: <path>` line per file —
+a name that is already taken lands as `name(1).ext`.
+
+```bash
+# send: code and link are on stdout within seconds; exits 0 once the
+# receiver has verified every byte
+npx -y freedrop report.pdf
+
+# receive what someone picked at freedrop.dev, from the link they shared
+npx -y freedrop -y -o downloads 'https://freedrop.dev/#…'
+```
+
+(`npx -y` skips npm's install prompt; the second `-y` is freedrop's.)
 
 ## vs. croc, wormhole, and friends
 

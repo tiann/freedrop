@@ -398,6 +398,31 @@ test("a code that starts with a dash parses as a code, not an option", { timeout
     assert.equal(await sha256(join(dst, "f.bin")), await sha256(join(W, "f.bin")));
 });
 
+// the harness runs every CLI the way agents and scripts do: stdin
+// ignored, stdout/stderr piped — no terminal anywhere
+test("without a terminal, a receiver without -y refuses instead of hanging", { timeout: 30_000 }, async () => {
+    // the link as the page displays it (no scheme) must parse as a code too
+    const recv = startCli([`freedrop.dev/#${randomBytes(32).toString("base64url")}`]);
+    assert.equal(await exited(recv, 10_000), 1, recv.out);
+    assert.match(recv.out, /pass -y/);
+});
+
+test("without a terminal: link accepted, saved paths reported, no QR or redraws", { timeout: 240_000 }, async () => {
+    const W = makeDir(join(TMP, "no-tty"));
+    const dst = makeDir(join(W, "dst"));
+    await makeRandom(join(W, "f.bin"), 3e6);
+    writeFileSync(join(dst, "f.bin"), "already here");
+    const sender = startCli([join(W, "f.bin")]); // QR left on: no terminal must suppress it
+    const code = await transferCode(sender);
+    const recv = startCli(["-y", "-o", dst, `https://freedrop.dev/#k=${code}`]);
+    assert.equal(await exited(recv), 0, recv.out);
+    assert.equal(await exited(sender), 0, sender.out);
+    assert.equal(await sha256(join(dst, "f(1).bin")), await sha256(join(W, "f.bin")));
+    assert.ok(recv.out.split("\n").includes(`saved: ${join(dst, "f(1).bin")}`), recv.out);
+    assert.doesNotMatch(sender.out, /[▀▄█]/, "no QR code without a terminal");
+    for (const p of [sender, recv]) assert.doesNotMatch(p.out, /[\r\x1b]/, "no in-place redraws");
+});
+
 test("twin files (same name/size/mtime, different bytes) resume-pair by manifest slot", { timeout: 300_000 }, async () => {
     const W = makeDir(join(TMP, "twins"));
     const dst = makeDir(join(W, "dst"));

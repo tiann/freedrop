@@ -40,10 +40,11 @@ const HELP = `freedrop — send files directly, CLI or browser, no server in the
 
 Usage:
   freedrop <file> [more files…]     send
-  freedrop <code>                   receive (code comes from the sender)
+  freedrop <code|link>              receive (the sender prints both)
 
 Options:
-  -y, --yes             receive without asking
+  -y, --yes             receive without asking (required when stdin is
+                        not a terminal)
   -o, --out <dir>       save received files here     (default current dir)
       --code <code>     send with a fixed code — resumes an interrupted
                         send: the receiver keeps its partial data
@@ -52,7 +53,8 @@ Options:
                         turn:/turns: URL used with --turn-auth
       --turn-auth <u:p> credentials for a --turn URL
       --broker <list>   comma-separated wss:// MQTT brokers to rendezvous on
-      --no-qr           don't print the QR code
+      --no-qr           don't print the QR code (never printed when stdout
+                        is not a terminal)
   -h, --help            show this help
   -v, --version         show version
 
@@ -65,6 +67,19 @@ Docs: https://github.com/tiann/freedrop`;
 // codes are base64url, so 1 in 64 starts with "-" — the parser must
 // recognize them before treating a leading dash as an option
 const looksLikeCode = (s) => /^[A-Za-z0-9_-]{40,48}$/.test(s);
+
+// people (and agents) get handed the browser link as often as the bare
+// code — take the code out of its fragment, read the way app.js reads it.
+// The scheme is optional: the page displays the link without one.
+const codeOf = (s) => {
+    if (looksLikeCode(s)) return s;
+    const m = /^(?:https?:\/\/)?[^\s#/]+\/[^\s#]*#(?:k=)?(.+)$/i.exec(s ?? "");
+    if (!m) return null;
+    try {
+        const c = decodeURIComponent(m[1]);
+        return looksLikeCode(c) ? c : null;
+    } catch { return null; }
+};
 
 const flags = {};
 const rest = [];
@@ -368,14 +383,28 @@ const fmtSize = (n) =>
     : n >= 1024 ? `${(n / 1024).toFixed(0)} KB`
     : `${n} B`;
 
-const status = (line) => process.stderr.write(`\r\x1b[K${line}`);
+// without a terminal (scripts, agents, logs) there is no line to redraw:
+// every status becomes a line of its own, so repeats are dropped and
+// progress is drawn rarely instead of ten times a second
+const TTY = !!process.stderr.isTTY;
+let lastLine = "";
+const status = (line) => {
+    if (TTY) return process.stderr.write(`\r\x1b[K${line}`);
+    const text = line.trimEnd();
+    if (!text || text === lastLine) return;
+    lastLine = text;
+    process.stderr.write(`${text}\n`);
+};
 
 // redrawing per chunk costs real throughput at these rates — throttle
 let lastDraw = 0;
+let lastDone = -1;
 function progressLine(verb, done, total, t0) {
     const now = Date.now();
-    if (now - lastDraw < 100 && done !== total) return;
+    if (done === lastDone) return;
+    if (now - lastDraw < (TTY ? 100 : 10_000) && done !== total) return;
     lastDraw = now;
+    lastDone = done;
     const secs = (now - t0) / 1000;
     const rate = secs > 0.2 ? `  ${fmtSize(done / secs)}/s` : "";
     const pct = total ? ` ${Math.floor((done / total) * 100)}%` : "";
@@ -427,8 +456,9 @@ async function send(paths) {
     }
     let key;
     if (flags.code) {
-        if (!looksLikeCode(flags.code)) die("--code: not a freedrop code");
-        key = Buffer.from(b64u.decode(flags.code));
+        const fixed = codeOf(flags.code);
+        if (!fixed) die("--code: not a freedrop code");
+        key = Buffer.from(b64u.decode(fixed));
     } else key = randomBytes(32);
     const code = b64u.encode(new Uint8Array(key));
     const turn = await turnServers();
@@ -441,7 +471,7 @@ async function send(paths) {
     console.log(`\nreceive with:   npx freedrop ${code}`);
     const link = `${PAGE}#${code}`;
     console.log(`or in browser:  ${link}\n`);
-    if (!flags.noQr) qrcode.generate(link, { small: true }, (art) => console.log(art));
+    if (!flags.noQr && process.stdout.isTTY) qrcode.generate(link, { small: true }, (art) => console.log(art));
     console.log("waiting for receiver…  (Ctrl-C to cancel)");
 
     let at = null; // current attempt
@@ -763,6 +793,12 @@ async function send(paths) {
 // later one.
 
 async function receive(code) {
+    // a prompt nobody can answer would wait forever — refuse up front,
+    // before the sender sees a receiver that will never accept
+    if (!flags.yes && !process.stdin.isTTY) {
+        die("stdin is not a terminal, so nothing can answer the save prompt.\n" +
+            "pass -y to receive without asking.");
+    }
     const startedAt = Date.now();
     const key = b64u.decode(code);
     const outDir = flags.out ?? ".";
@@ -986,6 +1022,8 @@ async function receive(code) {
         const secs = ((Date.now() - t0) / 1000).toFixed(1);
         status("");
         console.log(`✓ received ${fmtSize(total)} in ${secs}s — verified`);
+        // landing may have picked "name(1).ext" — say where each file went
+        for (const f of files) console.log(`saved: ${f.path}`);
         if (!notified) console.log("(the sender could not be told — if it is still running, Ctrl-C it)");
         setTimeout(() => {
             teardownAttempt();
@@ -1328,11 +1366,11 @@ if (rest.length === 0) {
 }
 if (rest.every((f) => existsSync(f) && statSync(f).isFile())) {
     await send(rest);
-} else if (rest.length === 1 && looksLikeCode(rest[0])) {
-    await receive(rest[0]);
+} else if (rest.length === 1 && codeOf(rest[0])) {
+    await receive(codeOf(rest[0]));
 } else {
     for (const f of rest) {
-        if (!existsSync(f) && !looksLikeCode(f)) {
+        if (!existsSync(f) && !codeOf(f)) {
             die(`"${f}" is neither an existing file nor a receive code`);
         }
         if (existsSync(f) && !statSync(f).isFile()) {
