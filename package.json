@@ -1,6 +1,6 @@
 {
   "name": "freedrop",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "description": "Direct file transfer between CLIs and browsers. No server touches your bytes: rendezvous over public MQTT brokers (encrypted), data over WebRTC, end to end.",
   "type": "module",
   "bin": {
