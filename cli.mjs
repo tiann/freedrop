@@ -21,7 +21,7 @@ import {
     writeFileSync, renameSync, rmSync, mkdirSync, rmdirSync, linkSync,
 } from "node:fs";
 import { open } from "node:fs/promises";
-import { basename, join } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { randomBytes, createHash } from "node:crypto";
 import { createInterface } from "node:readline";
 import qrcode from "qrcode-terminal";
@@ -55,12 +55,62 @@ Options:
       --broker <list>   comma-separated wss:// MQTT brokers to rendezvous on
       --no-qr           don't print the QR code (never printed when stdout
                         is not a terminal)
+      --timeout <dur>   send: give up after this long with no transfer
+                        under way (seconds, or 90s / 10m / 1h)
+      --json            one JSON event per line on stdout; human text
+                        moves to stderr
   -h, --help            show this help
   -v, --version         show version
 
 Interrupted transfers resume: re-run the same receive command (and, if the
 sender died too, re-send with --code and the same files).
+
+Exit status: 0 done, 1 error, 2 bad arguments, 3 no broker reachable,
+4 peers could not connect (retry with --turn), 5 verification failed,
+6 declined, 7 timed out or no sender found, 8 connection lost (re-run to
+resume), 130/143 interrupted.
 Docs: https://github.com/tiann/freedrop`;
+
+// ---- output for scripts and agents -------------------------------------------
+// --json gives stdout to one JSON event per line and moves every human
+// line to stderr. Exit codes are API in both modes: callers branch on
+// them (retry with --turn, re-run to resume, stop retrying).
+
+const JSON_OUT = process.argv.includes("--json");
+// macOS pipes are asynchronous: block so process.exit can't drop events
+if (JSON_OUT) process.stdout._handle?.setBlocking?.(true);
+
+const EXIT = {
+    failed: 1,
+    usage: 2,
+    broker: 3, // no rendezvous broker reachable
+    connect: 4, // the peers met but WebRTC could not connect — needs TURN
+    verify: 5, // a file failed verification, or changed while sending
+    declined: 6,
+    timeout: 7, // nobody showed up in time
+    lost: 8, // connection lost mid-transfer; partial data kept
+};
+const EXIT_NAME = Object.fromEntries(Object.entries(EXIT).map(([k, v]) => [v, k]));
+
+const emit = JSON_OUT ? (ev) => process.stdout.write(`${JSON.stringify(ev)}\n`) : () => {};
+const say = JSON_OUT ? console.error : console.log;
+
+const die = (msg, code = EXIT.failed) => {
+    emit({ event: "error", error: EXIT_NAME[code], code, message: msg.trim() });
+    console.error(msg);
+    process.exit(code);
+};
+
+// Ctrl-C, or the SIGTERM a caller's timeout sends: flush, explain, exit
+const onSignals = (cleanup) => {
+    for (const [sig, code] of [["SIGINT", 130], ["SIGTERM", 143]]) {
+        process.on(sig, () => {
+            cleanup();
+            emit({ event: "error", error: "interrupted", code, message: sig });
+            process.exit(code);
+        });
+    }
+};
 
 // ---- tiny arg parser -------------------------------------------------------
 
@@ -104,9 +154,10 @@ const rest = [];
         else if (a === "--turn") flags.turn = argv[++i];
         else if (a === "--turn-auth") flags.turnAuth = argv[++i];
         else if (a === "--broker") flags.broker = argv[++i];
+        else if (a === "--timeout") flags.timeout = argv[++i];
+        else if (a === "--json") {} // read up front, before anything prints
         else if (a.startsWith("-") && !looksLikeCode(a)) {
-            console.error(`unknown option: ${a}\nrun freedrop --help for usage`);
-            process.exit(1);
+            die(`unknown option: ${a}\nrun freedrop --help for usage`, EXIT.usage);
         } else rest.push(a);
     }
 }
@@ -115,10 +166,16 @@ const BROKERS = flags.broker
     ? flags.broker.split(",").map((s) => s.trim()).filter(Boolean)
     : DEFAULT_BROKERS;
 
-if (typeof WebSocket === "undefined") {
-    console.error("freedrop needs Node 22+ (built-in WebSocket)");
-    process.exit(1);
-}
+const TIMEOUT_MS = (() => {
+    if (flags.timeout === undefined) return 0;
+    const m = /^(\d+(?:\.\d+)?)([smh]?)$/.exec(flags.timeout ?? "");
+    if (!m || !(Number(m[1]) > 0)) {
+        die(`--timeout: expected seconds, or a number with s/m/h — got "${flags.timeout}"`, EXIT.usage);
+    }
+    return Number(m[1]) * { "": 1e3, s: 1e3, m: 6e4, h: 36e5 }[m[2]];
+})();
+
+if (typeof WebSocket === "undefined") die("freedrop needs Node 22+ (built-in WebSocket)");
 
 // ---- WebRTC engine ----------------------------------------------------------
 // node-datachannel (libdatachannel bindings): native SCTP with real
@@ -222,8 +279,7 @@ async function turnServers() {
     if (t === "cloudflare") {
         const { CF_TURN_KEY_ID, CF_TURN_API_TOKEN } = process.env;
         if (!CF_TURN_KEY_ID || !CF_TURN_API_TOKEN) {
-            console.error("--turn cloudflare needs CF_TURN_KEY_ID and CF_TURN_API_TOKEN in the environment");
-            process.exit(1);
+            die("--turn cloudflare needs CF_TURN_KEY_ID and CF_TURN_API_TOKEN in the environment", EXIT.usage);
         }
         const res = await fetch(
             `https://rtc.live.cloudflare.com/v1/turn/keys/${CF_TURN_KEY_ID}/credentials/generate-ice-servers`,
@@ -246,18 +302,14 @@ async function turnServers() {
     }
     if (/^turns?:/i.test(t)) {
         const at = (flags.turnAuth ?? "").indexOf(":");
-        if (at < 0) {
-            console.error("--turn with a turn:/turns: URL needs --turn-auth user:pass");
-            process.exit(1);
-        }
+        if (at < 0) die("--turn with a turn:/turns: URL needs --turn-auth user:pass", EXIT.usage);
         return [{
             urls: t.split(",").map((u) => u.trim()),
             username: flags.turnAuth.slice(0, at),
             credential: flags.turnAuth.slice(at + 1),
         }];
     }
-    console.error(`--turn: expected "cloudflare" or a turn:/turns: URL, got "${t}"`);
-    process.exit(1);
+    die(`--turn: expected "cloudflare" or a turn:/turns: URL, got "${t}"`, EXIT.usage);
 }
 
 // ---- wire framing -----------------------------------------------------------
@@ -388,27 +440,40 @@ const fmtSize = (n) =>
 // progress is drawn rarely instead of ten times a second
 const TTY = !!process.stderr.isTTY;
 let lastLine = "";
-const status = (line) => {
+const draw = (line) => {
     if (TTY) return process.stderr.write(`\r\x1b[K${line}`);
     const text = line.trimEnd();
     if (!text || text === lastLine) return;
     lastLine = text;
     process.stderr.write(`${text}\n`);
 };
+let lastStatus = "";
+const status = (line) => {
+    draw(line);
+    const text = line.trim();
+    if (text && text !== lastStatus) emit({ event: "status", message: (lastStatus = text) });
+};
 
-// redrawing per chunk costs real throughput at these rates — throttle
+// redrawing per chunk costs real throughput at these rates — throttle.
+// `skipped` counts bytes an earlier attempt already delivered: the line
+// shows this attempt, the event the whole transfer.
 let lastDraw = 0;
+let lastEvent = 0;
 let lastDone = -1;
-function progressLine(verb, done, total, t0) {
-    const now = Date.now();
+function progressLine(verb, done, total, t0, skipped = 0) {
     if (done === lastDone) return;
+    lastDone = done;
+    const now = Date.now();
+    if (now - lastEvent >= 10_000 || done === total) {
+        lastEvent = now;
+        emit({ event: "progress", bytes: skipped + done, total: skipped + total });
+    }
     if (now - lastDraw < (TTY ? 100 : 10_000) && done !== total) return;
     lastDraw = now;
-    lastDone = done;
     const secs = (now - t0) / 1000;
     const rate = secs > 0.2 ? `  ${fmtSize(done / secs)}/s` : "";
     const pct = total ? ` ${Math.floor((done / total) * 100)}%` : "";
-    status(`${verb}${pct}  ${fmtSize(done)} / ${fmtSize(total)}${rate}`);
+    draw(`${verb}${pct}  ${fmtSize(done)} / ${fmtSize(total)}${rate}`);
 }
 
 // P2P failure before any data is the one error fresh users hit — explain it
@@ -416,11 +481,6 @@ const NAT_HINT =
     "\nWebRTC could not connect (symmetric NAT or CGNAT on both ends?).\n" +
     "Retry with a TURN relay on the SENDING side: --turn cloudflare\n" +
     "(free 1 TB/month — see the README)";
-
-const die = (msg) => {
-    console.error(msg);
-    process.exit(1);
-};
 
 const dbg = process.env.FREEDROP_DEBUG ? (...a) => console.error("\n[dbg]", ...a) : null;
 
@@ -457,38 +517,60 @@ async function send(paths) {
     let key;
     if (flags.code) {
         const fixed = codeOf(flags.code);
-        if (!fixed) die("--code: not a freedrop code");
+        if (!fixed) die("--code: not a freedrop code", EXIT.usage);
         key = Buffer.from(b64u.decode(fixed));
     } else key = randomBytes(32);
     const code = b64u.encode(new Uint8Array(key));
-    const turn = await turnServers();
+    const turn = await turnServers().catch((e) => die(`--turn: ${e.message}`));
 
     const room = await SignalRoom.create({ key, role: "host", brokers: BROKERS })
-        .catch((e) => die(`cannot reach any rendezvous broker: ${e.message}`));
+        .catch((e) => die(`cannot reach any rendezvous broker: ${e.message}`, EXIT.broker));
 
-    console.log(`freedrop: ${files.length} file(s), ${fmtSize(total)}`);
-    for (const f of files) console.log(`  ${f.name}  (${fmtSize(f.size)})`);
-    console.log(`\nreceive with:   npx freedrop ${code}`);
+    say(`freedrop: ${files.length} file(s), ${fmtSize(total)}`);
+    for (const f of files) say(`  ${f.name}  (${fmtSize(f.size)})`);
+    say(`\nreceive with:   npx freedrop ${code}`);
     const link = `${PAGE}#${code}`;
-    console.log(`or in browser:  ${link}\n`);
-    if (!flags.noQr && process.stdout.isTTY) qrcode.generate(link, { small: true }, (art) => console.log(art));
-    console.log("waiting for receiver…  (Ctrl-C to cancel)");
+    say(`or in browser:  ${link}\n`);
+    if (!flags.noQr && !JSON_OUT && process.stdout.isTTY) {
+        qrcode.generate(link, { small: true }, (art) => console.log(art));
+    }
+    say("waiting for receiver…  (Ctrl-C to cancel)");
+    emit({ event: "ready", code, link, files: files.map(({ name, size }) => ({ name, size })), total });
 
     let at = null; // current attempt
     let acceptedEver = false;
     let done = false;
+    let natFailed = false; // a receiver came, but WebRTC could not reach it
     const t0 = { v: 0 };
+    const resumeCmd = `freedrop --code ${code} ${paths.map(shellQuote).join(" ")}`;
 
-    process.on("SIGINT", () => {
+    onSignals(() => {
         if (acceptedEver && !done) {
-            console.error(
-                "\ninterrupted — the receiver keeps its partial data.\nresume with:\n" +
-                `  freedrop --code ${code} ${paths.map(shellQuote).join(" ")}`,
-            );
+            console.error(`\ninterrupted — the receiver keeps its partial data.\nresume with:\n  ${resumeCmd}`);
         }
         try { room.close(); } catch {}
-        process.exit(130);
     });
+
+    // --timeout: a sender in the background must not wait forever for a
+    // receiver that never comes, or never comes back. Only time without
+    // a transfer under way counts — a live transfer is never cut short.
+    if (TIMEOUT_MS) {
+        let idleSince = Date.now();
+        const timer = setInterval(() => {
+            if (at && !at.dead && at.streaming) {
+                idleSince = 0;
+            } else if (!idleSince) {
+                idleSince = Date.now();
+            } else if (Date.now() - idleSince >= TIMEOUT_MS) {
+                status("");
+                if (natFailed && !acceptedEver) die(NAT_HINT, EXIT.connect);
+                die(acceptedEver
+                    ? `\nthe receiver did not come back in time — it keeps its partial data.\nresume with:\n  ${resumeCmd}`
+                    : "\nno receiver in time", EXIT.timeout);
+            }
+        }, 1000);
+        timer.unref?.();
+    }
 
     const teardown = (a) => {
         if (!a) return;
@@ -586,7 +668,7 @@ async function send(paths) {
                             const c = await pickChannel(a);
                             sendChunk(a, c, p, block.subarray(p - gs, q - gs));
                             sent += q - p;
-                            progressLine("sending", sent, need, t0.v);
+                            progressLine("sending", sent, need, t0.v, total - need);
                             if (BPS) {
                                 const ahead = (sent / BPS) * 1000 - (Date.now() - t0.v);
                                 if (ahead > 50) await new Promise((r) => setTimeout(r, ahead));
@@ -596,7 +678,7 @@ async function send(paths) {
                     local += block.length;
                 }
             }
-            if (local !== f.size) die(`\n${f.name}: size changed while sending — re-run to restart`);
+            if (local !== f.size) die(`\n${f.name}: size changed while sending — re-run to restart`, EXIT.verify);
             sendCtl(a, { t: "hash", i: fi, sha: hasher.digest() });
         }
         sendCtl(a, { t: "eof" });
@@ -686,10 +768,13 @@ async function send(paths) {
             dbg?.(`send conn 0 pc: ${pc.connectionState}`);
             if (pc.connectionState === "failed" && !a.dead) {
                 teardown(a);
-                if (at === a) {
+                if (at === a && acceptedEver) {
+                    status("receiver lost — waiting for a reconnect…  (Ctrl-C to stop)");
+                } else if (at === a) {
+                    natFailed = true;
                     status("");
-                    console.error(acceptedEver ? "receiver lost — waiting for a reconnect…  (Ctrl-C to stop)" : NAT_HINT);
-                    if (!acceptedEver) console.error("still waiting — a receiver retry may get through…");
+                    console.error(`${NAT_HINT}\nstill waiting — a receiver retry may get through…`);
+                    emit({ event: "status", message: NAT_HINT.trim() });
                 }
             }
         };
@@ -726,12 +811,13 @@ async function send(paths) {
                 done = true;
                 const secs = ((Date.now() - t0.v) / 1000).toFixed(1);
                 status("");
-                console.log(`✓ sent ${fmtSize(total)} in ${secs}s — verified by the receiver`);
+                say(`✓ sent ${fmtSize(total)} in ${secs}s — verified by the receiver`);
+                emit({ event: "done", total, seconds: Number(secs) });
                 teardown(a);
                 room.close();
                 setTimeout(() => process.exit(0), 300);
             } else if (m.t === "reject") {
-                die("\nreceiver declined the transfer");
+                die("\nreceiver declined the transfer", EXIT.declined);
             }
         };
         dc.onopen = () => {
@@ -797,7 +883,7 @@ async function receive(code) {
     // before the sender sees a receiver that will never accept
     if (!flags.yes && !process.stdin.isTTY) {
         die("stdin is not a terminal, so nothing can answer the save prompt.\n" +
-            "pass -y to receive without asking.");
+            "pass -y to receive without asking.", EXIT.usage);
     }
     const startedAt = Date.now();
     const key = b64u.decode(code);
@@ -808,10 +894,10 @@ async function receive(code) {
     const rid = createHash("sha256").update(`freedrop-stage:${code}`).digest("hex").slice(0, 20);
     const stageRoot = join(outDir, ".freedrop-stage");
     const stageDir = join(stageRoot, rid);
-    const turnExtra = await turnServers();
+    const turnExtra = await turnServers().catch((e) => die(`--turn: ${e.message}`));
     const waitMs = Math.min(10_000, Math.max(1, CONNECT_WINDOW - (Date.now() - startedAt)));
     const room = await SignalRoom.create({ key, role: "viewer", brokers: BROKERS, waitMs })
-        .catch((e) => die(`cannot reach any rendezvous broker: ${e.message}`));
+        .catch((e) => die(`cannot reach any rendezvous broker: ${e.message}`, EXIT.broker));
 
     // ---- transfer state (survives attempts) ----
     let manifest = null;
@@ -851,24 +937,22 @@ async function receive(code) {
         }
     };
 
+    // the partial data lives in outDir — a re-run without the same -o
+    // would start over somewhere else
     const resumeHint = () =>
-        console.error(
-            `\n${fmtSize(coveredTotal)} of ${fmtSize(total)} is saved.\n` +
-            `resume by re-running:  freedrop ${code}`,
-        );
+        `\n${fmtSize(coveredTotal)} of ${fmtSize(total)} is saved.\n` +
+        `resume by re-running:  freedrop${flags.yes ? " -y" : ""}` +
+        `${flags.out ? ` -o ${shellQuote(flags.out)}` : ""} ${code}`;
 
-    process.on("SIGINT", () => {
+    onSignals(() => {
         try { flushStates(); } catch {}
-        if (acceptedEver && !finished) resumeHint();
-        process.exit(130);
+        if (acceptedEver && !finished) console.error(resumeHint());
     });
 
     const giveUp = () => {
         flushStates();
         status("");
-        console.error("connection lost and could not be re-established.");
-        if (acceptedEver) resumeHint();
-        process.exit(1);
+        die("connection lost and could not be re-established." + (acceptedEver ? resumeHint() : ""), EXIT.lost);
     };
 
     // the journal for one manifest slot, if it is valid for this
@@ -1021,10 +1105,11 @@ async function receive(code) {
         sendCtl({ t: "done" });
         const secs = ((Date.now() - t0) / 1000).toFixed(1);
         status("");
-        console.log(`✓ received ${fmtSize(total)} in ${secs}s — verified`);
+        say(`✓ received ${fmtSize(total)} in ${secs}s — verified`);
         // landing may have picked "name(1).ext" — say where each file went
-        for (const f of files) console.log(`saved: ${f.path}`);
-        if (!notified) console.log("(the sender could not be told — if it is still running, Ctrl-C it)");
+        for (const f of files) say(`saved: ${f.path}`);
+        if (!notified) say("(the sender could not be told — if it is still running, Ctrl-C it)");
+        emit({ event: "done", total, seconds: Number(secs) });
         setTimeout(() => {
             teardownAttempt();
             room.close();
@@ -1066,16 +1151,19 @@ async function receive(code) {
                         `\n${basename(f.name)}: the copy received earlier no longer matches ` +
                         "the sender's file (same name/size/mtime, different content).\n" +
                         "re-run to transfer the new version — it will land beside the old one.",
+                        EXIT.verify,
                     );
                 }
                 rmSync(partPath(f), { force: true });
                 die(
                     `\n${basename(f.name)}: verification failed — the sender's file changed, ` +
                     "or data was corrupted.\npartial data discarded; re-run to transfer it fresh.",
+                    EXIT.verify,
                 );
             }
             if (!f.inPlace) f.path = land(f);
             f.done = true;
+            emit({ event: "saved", name: basename(f.name), path: resolve(f.path), size: f.size });
             if (++completed === files.length) finishAll();
         })().catch((e) => die(`\n${basename(f.name)}: ${e.message}`));
     };
@@ -1170,10 +1258,15 @@ async function receive(code) {
             base += mf.size;
             return entry;
         });
-        console.log(`incoming: ${manifest.length} file(s), ${fmtSize(total)}`);
-        for (const f of manifest) console.log(`  ${basename(f.name)}  (${fmtSize(f.size)})`);
+        say(`incoming: ${manifest.length} file(s), ${fmtSize(total)}`);
+        for (const f of manifest) say(`  ${basename(f.name)}  (${fmtSize(f.size)})`);
+        emit({
+            event: "incoming",
+            files: manifest.map((f) => ({ name: basename(f.name), size: f.size })),
+            total, resumed: coveredTotal,
+        });
         if (coveredTotal > 0) {
-            console.log(`resuming — ${fmtSize(coveredTotal)} already on disk`);
+            say(`resuming — ${fmtSize(coveredTotal)} already on disk`);
             return acceptNow(); // the user accepted this transfer once already
         }
         if (flags.yes) return acceptNow();
@@ -1182,7 +1275,7 @@ async function receive(code) {
             rl.close();
             if (/^n/i.test(a.trim())) {
                 sendCtl({ t: "reject" });
-                process.exit(1);
+                die("declined — nothing saved", EXIT.declined);
             }
             acceptNow();
         });
@@ -1202,7 +1295,7 @@ async function receive(code) {
         if (finished || coveredTotal === total) return;
         if (coveredTotal > coveredAtEof) moreRounds = 0;
         coveredAtEof = coveredTotal;
-        if (++moreRounds > 5) die("\ntransfer cannot complete — data lost on every fill round");
+        if (++moreRounds > 5) die("\ntransfer cannot complete — data lost on every fill round", EXIT.lost);
         dbg?.(`eof with gaps — requesting fill round ${moreRounds}`);
         // gap chunks arrive at lower offsets than the stripes have seen;
         // lift the per-channel replay guard for the new round
@@ -1256,7 +1349,8 @@ async function receive(code) {
         const now = Date.now();
         if (!manifest) {
             if (now - startedAt >= CONNECT_WINDOW) {
-                die(senderFound ? NAT_HINT : "no sender found — is `freedrop <files>` still running on the other side?");
+                if (senderFound) die(NAT_HINT, EXIT.connect);
+                die("no sender found — is `freedrop <files>` still running on the other side?", EXIT.timeout);
             }
             status("connection lost — reconnecting…");
             startAttempt();
@@ -1371,11 +1465,11 @@ if (rest.every((f) => existsSync(f) && statSync(f).isFile())) {
 } else {
     for (const f of rest) {
         if (!existsSync(f) && !codeOf(f)) {
-            die(`"${f}" is neither an existing file nor a receive code`);
+            die(`"${f}" is neither an existing file nor a receive code`, EXIT.usage);
         }
         if (existsSync(f) && !statSync(f).isFile()) {
-            die(`"${f}" is not a regular file (directories: tar it for now)`);
+            die(`"${f}" is not a regular file (directories: tar it for now)`, EXIT.usage);
         }
     }
-    die("mixed arguments — pass files to send, or one code to receive");
+    die("mixed arguments — pass files to send, or one code to receive", EXIT.usage);
 }

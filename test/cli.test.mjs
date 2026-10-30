@@ -12,7 +12,7 @@ import {
 import { dirname, join } from "node:path";
 import { randomBytes } from "node:crypto";
 import {
-    ROOT, startCli, killAll, waitFor, transferCode, exited, sleep,
+    ROOT, startCli, killAll, waitFor, transferCode, exited, sleep, events,
     makeDir, makeRandom, sha256, stageJournal, journalCovered, journalDone,
 } from "./helpers.mjs";
 
@@ -270,7 +270,7 @@ test("a done-marked file is re-verified against the current run's hash", { timeo
     utimesSync(join(W, "first.bin"), st.atime, st.mtime);
     const sender2 = startCli(["--no-qr", "--code", code, join(W, "first.bin"), join(W, "second.bin")]);
     const recv2 = startCli(["-y", "-o", dst, code]);
-    assert.notEqual(await exited(recv2), 0, "claiming success with old bytes would be a lie");
+    assert.equal(await exited(recv2), 5, "claiming success with old bytes would be a lie");
     assert.match(recv2.out, /no longer matches/, recv2.out);
     assert.equal(await sha256(join(dst, "first.bin")), oldHash, "the finished old copy is kept");
     assert.ok(!existsSync(stageJournal(dst, code, 0)), "stale done marker dropped");
@@ -403,7 +403,7 @@ test("a code that starts with a dash parses as a code, not an option", { timeout
 test("without a terminal, a receiver without -y refuses instead of hanging", { timeout: 30_000 }, async () => {
     // the link as the page displays it (no scheme) must parse as a code too
     const recv = startCli([`freedrop.dev/#${randomBytes(32).toString("base64url")}`]);
-    assert.equal(await exited(recv, 10_000), 1, recv.out);
+    assert.equal(await exited(recv, 10_000), 2, recv.out);
     assert.match(recv.out, /pass -y/);
 });
 
@@ -421,6 +421,46 @@ test("without a terminal: link accepted, saved paths reported, no QR or redraws"
     assert.ok(recv.out.split("\n").includes(`saved: ${join(dst, "f(1).bin")}`), recv.out);
     assert.doesNotMatch(sender.out, /[▀▄█]/, "no QR code without a terminal");
     for (const p of [sender, recv]) assert.doesNotMatch(p.out, /[\r\x1b]/, "no in-place redraws");
+});
+
+test("--json: stdout carries only events, human text moves to stderr", { timeout: 240_000 }, async () => {
+    const W = makeDir(join(TMP, "json"));
+    const dst = makeDir(join(W, "dst"));
+    await makeRandom(join(W, "a.bin"), 3e6);
+    await makeRandom(join(W, "b.bin"), 0);
+    const sender = startCli(["--json", join(W, "a.bin"), join(W, "b.bin")]);
+    const code = await transferCode(sender);
+    const recv = startCli(["--json", "-y", "-o", dst, code]);
+    assert.equal(await exited(recv), 0, recv.out);
+    assert.equal(await exited(sender), 0, sender.out);
+    const files = [{ name: "a.bin", size: 3e6 }, { name: "b.bin", size: 0 }];
+    const se = events(sender); // throws on any stdout line that is not JSON
+    const re = events(recv);
+
+    const { link, ...ready } = se[0];
+    assert.deepEqual(ready, { event: "ready", code, files, total: 3e6 });
+    assert.ok(link.endsWith(`#${code}`), link);
+    assert.ok(se.some((e) => e.event === "progress" && e.bytes === 3e6 && e.total === 3e6), sender.stdoutText);
+    assert.equal(se.at(-1).event, "done");
+
+    assert.deepEqual(re.find((e) => e.event === "incoming"), { event: "incoming", files, total: 3e6, resumed: 0 });
+    assert.deepEqual(re.filter((e) => e.event === "saved").map((e) => e.path).sort(),
+        [join(dst, "a.bin"), join(dst, "b.bin")]);
+    assert.equal(re.at(-1).event, "done");
+    assert.match(recv.out, /✓ received/, "human lines still reach stderr");
+    assert.equal(await sha256(join(dst, "a.bin")), await sha256(join(W, "a.bin")));
+});
+
+test("exit codes: bad arguments exit 2, a sender's --timeout exits 7", { timeout: 60_000 }, async () => {
+    const bad = startCli(["--json", "--bogus"]);
+    assert.equal(await exited(bad, 10_000), 2, bad.out);
+    assert.deepEqual(events(bad).map((e) => [e.event, e.error]), [["error", "usage"]]);
+
+    const W = makeDir(join(TMP, "timeout"));
+    await makeRandom(join(W, "f.bin"), 1000);
+    const sender = startCli(["--json", "--timeout", "2", join(W, "f.bin")]);
+    assert.equal(await exited(sender, 40_000), 7, sender.out);
+    assert.deepEqual(events(sender).map((e) => e.event), ["ready", "error"]);
 });
 
 test("twin files (same name/size/mtime, different bytes) resume-pair by manifest slot", { timeout: 300_000 }, async () => {

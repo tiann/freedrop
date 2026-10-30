@@ -21,8 +21,9 @@ export function startCli(args, env = {}, options = {}) {
         env: { ...process.env, ...env },
         ...options,
     });
-    p.out = "";
-    p.stdout.on("data", (d) => { p.out += d; });
+    p.out = ""; // stdout + stderr, as a person would see them
+    p.stdoutText = "";
+    p.stdout.on("data", (d) => { p.out += d; p.stdoutText += d; });
     p.stderr.on("data", (d) => { p.out += d; });
     kids.add(p);
     p.on("exit", () => kids.delete(p));
@@ -54,6 +55,9 @@ export const exited = (proc, ms = 180_000) =>
     waitFor(() => proc.exitCode !== null, ms, "process exit").then(() => proc.exitCode);
 
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// a --json process's stdout: every line must be one JSON event
+export const events = (proc) => proc.stdoutText.split("\n").filter(Boolean).map((l) => JSON.parse(l));
 
 export function makeDir(p) {
     rmSync(p, { recursive: true, force: true });

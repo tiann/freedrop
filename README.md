@@ -75,6 +75,8 @@ traffic bill, and why nobody's server ever holds your data.
 | `--turn-auth <u:p>` | both | credentials for a `--turn` URL |
 | `--broker <list>` | both | custom comma-separated `wss://` MQTT brokers |
 | `--no-qr` | send | don't print the QR code (never printed without a terminal) |
+| `--timeout <dur>` | send | give up after this long with no transfer under way (`600`, `90s`, `10m`, `1h`) |
+| `--json` | both | one JSON event per line on stdout; human text moves to stderr |
 
 Node 22+ (uses the built-in WebSocket).
 
@@ -89,15 +91,46 @@ the browser link as readily as the bare code (with or without
 a name that is already taken lands as `name(1).ext`.
 
 ```bash
-# send: code and link are on stdout within seconds; exits 0 once the
-# receiver has verified every byte
-npx -y freedrop report.pdf
+# send to a person: hand them the link, wait for it to finish. Without
+# --timeout a sender waits for a receiver indefinitely.
+npx -y freedrop --json --timeout 10m report.pdf
 
 # receive what someone picked at freedrop.dev, from the link they shared
-npx -y freedrop -y -o downloads 'https://freedrop.dev/#…'
+npx -y freedrop --json -y -o downloads 'https://freedrop.dev/#…'
 ```
 
 (`npx -y` skips npm's install prompt; the second `-y` is freedrop's.)
+
+With `--json`, stdout carries nothing but these events, one per line:
+
+| event | side | fields |
+|---|---|---|
+| `ready` | send | `code`, `link`, `files` (`[{name, size}]`), `total` — share the link now |
+| `incoming` | receive | `files`, `total`, `resumed` (bytes already on disk) |
+| `progress` | both | `bytes`, `total` — at most every 10 s, and at 100 %; a sender counts bytes sent, a receiver bytes on disk |
+| `saved` | receive | `name`, `path` (absolute), `size` — once per verified file |
+| `status` | both | `message` — human-readable, wording may change |
+| `done` | both | `total`, `seconds` — then exit 0 |
+| `error` | both | `error`, `code` (the exit status), `message` — then exit |
+
+Exit statuses are stable in both modes:
+
+| code | `error` | meaning | what to do |
+|---|---|---|---|
+| 0 | | every file verified | |
+| 1 | `failed` | anything else | read the message |
+| 2 | `usage` | bad arguments, or a receiver without `-y` and no terminal | fix the command |
+| 3 | `broker` | no rendezvous broker reachable | check the network or `--broker` |
+| 4 | `connect` | the peers met but WebRTC could not connect | retry with `--turn` on the sending side |
+| 5 | `verify` | a file failed verification or changed while sending | a re-run transfers it fresh |
+| 6 | `declined` | the receiver said no | |
+| 7 | `timeout` | `--timeout` passed, or a receiver found no sender | check the code; is the sender still running? |
+| 8 | `lost` | connection lost mid-transfer | re-run the same command — it resumes |
+| 130 / 143 | `interrupted` | SIGINT / SIGTERM | re-run the same command to resume |
+
+Interrupted and lost transfers print the exact command that resumes them.
+The same guide, written for agents, is served at
+[freedrop.dev/llms.txt](https://freedrop.dev/llms.txt).
 
 ## vs. croc, wormhole, and friends
 
